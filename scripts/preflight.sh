@@ -133,15 +133,25 @@ if [ "$rootfs" = zfs ]; then
 fi
 
 echo "== overlayfs on a Docker volume (what the node's containerd does)"
-vol="arc-on-nas-preflight-$$"
-if "${docker[@]}" run --rm --privileged -v "$vol:/v" "$test_image" sh -c \
-     'mkdir -p /v/l /v/u /v/w /v/m && mount -t overlay overlay -o lowerdir=/v/l,upperdir=/v/u,workdir=/v/w /v/m && touch /v/m/x && umount /v/m' \
-     >/dev/null 2>&1; then
-  pass "overlayfs mounts on a Docker volume"
-else
-  fail "overlayfs does not mount on a Docker volume here; set K3S_SNAPSHOTTER=native in .env (README, \"Troubleshooting\")"
+# The test image first, with one retry, so a registry or network problem is not reported as a
+# storage one.
+out=""
+if ! "${docker[@]}" image inspect "$test_image" >/dev/null 2>&1; then
+  out=$("${docker[@]}" pull -q "$test_image" 2>&1) || { sleep 5; out=$("${docker[@]}" pull -q "$test_image" 2>&1); } || out="PULL FAILED: $out"
 fi
-"${docker[@]}" volume rm -f "$vol" >/dev/null 2>&1 || true
+case "$out" in
+  "PULL FAILED: "*)
+    fail "cannot pull $test_image for the overlayfs test, twice (a registry or network problem, not storage): $(tail -n 1 <<< "${out#PULL FAILED: }")" ;;
+  *)
+    vol="arc-on-nas-preflight-$$"
+    if out=$("${docker[@]}" run --rm --privileged -v "$vol:/v" "$test_image" sh -c \
+         'mkdir -p /v/l /v/u /v/w /v/m && mount -t overlay overlay -o lowerdir=/v/l,upperdir=/v/u,workdir=/v/w /v/m && touch /v/m/x && umount /v/m' 2>&1); then
+      pass "overlayfs mounts on a Docker volume"
+    else
+      fail "overlayfs does not mount on a Docker volume here ($(tail -n 1 <<< "$out")); set K3S_SNAPSHOTTER=native in .env (README, \"Troubleshooting\")"
+    fi
+    "${docker[@]}" volume rm -f "$vol" >/dev/null 2>&1 || true ;;
+esac
 
 echo "== Resources"
 cpus=$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN)
