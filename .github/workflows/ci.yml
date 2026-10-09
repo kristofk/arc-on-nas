@@ -57,7 +57,7 @@ jobs:
     name: Smoke test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       CHART_VERSION: "0.15.0"
       CHARTS: oci://ghcr.io/actions/actions-runner-controller-charts
@@ -77,6 +77,7 @@ jobs:
           # Hosted runners have 2 CPUs and 8 GB (private repositories) or 4 and 16 (public). Size
           # as README "Sizing" does: allocatable 1500m CPU and 2560Mi, kube-reserved 250m and
           # 512Mi, the rest reserved for the "host"; caps a little above allocatable + kube-reserved.
+          # k3s sets no memory eviction threshold, so nothing else is subtracted.
           cpus=$(nproc)
           mem=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
           cat > .env <<EOF
@@ -85,7 +86,7 @@ jobs:
           K3S_MEMORY=4g
           K3S_CPU_SHARES=256
           K3S_PIDS_LIMIT=32768
-          K3S_SYSTEM_RESERVED=cpu=$(( cpus * 1000 - 1500 - 250 ))m,memory=$(( mem - 2560 - 512 - 100 ))Mi
+          K3S_SYSTEM_RESERVED=cpu=$(( cpus * 1000 - 1500 - 250 ))m,memory=$(( mem - 2560 - 512 ))Mi
           K3S_KUBE_RESERVED=cpu=250m,memory=512Mi
           K3S_SNAPSHOTTER=overlayfs
           K3S_EXTRA_ARGS=
@@ -250,10 +251,8 @@ jobs:
           c=$(docker run --rm --network ci_runners "$CURL_IMAGE" \
                 -sS -o /dev/null -m 10 -w '%{http_code}' "http://$GATEWAY:18080/" || true)
           echo "host port via the gateway, from a container on the network: $c"
-          if [ "$c" != 200 ]; then
-            echo "::warning::A plain container on the stack network could not reach the host's port either;"\
-              "the NetworkPolicy check below is inconclusive on this runner."
-          fi
+          # The control: without it, the pod's failure below would prove nothing.
+          [ "$c" = 200 ]
           c=$(code --noproxy '*' "http://$GATEWAY:18080/"); echo "host port via the gateway, from the pod: $c"
           [ "$c" = 000 ]
           k -n arc-runners delete pod egress-test --wait=false

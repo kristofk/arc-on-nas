@@ -123,6 +123,14 @@ df_line=$(df -Pk "$rootdir" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024) " 
 info "Docker root: ${df_line:-unknown}"
 
 if [ -f "$root/.env" ]; then
+  k3s_cpus=$(sed -n 's/^K3S_CPUS=//p' "$root/.env" | tail -n 1)
+  if [ -n "$k3s_cpus" ]; then
+    if awk -v a="$k3s_cpus" -v b="$cpus" 'BEGIN { exit !(a > b) }'; then
+      fail "K3S_CPUS=$k3s_cpus in .env is more than the host's $cpus CPUs; Docker will refuse to start the node"
+    else
+      pass "K3S_CPUS=$k3s_cpus fits the host's $cpus CPUs"
+    fi
+  fi
   cache_dir=$(sed -n 's/^CACHE_DIR=//p' "$root/.env" | tail -n 1)
   if [ -n "$cache_dir" ] && [ -d "$cache_dir" ]; then
     info "cache directory $cache_dir: $(df -Pk "$cache_dir" | awk 'NR==2 {print int($4/1024/1024) " GiB free"}'), on $(stat -fc %T "$cache_dir")"

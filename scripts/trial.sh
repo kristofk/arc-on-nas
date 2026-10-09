@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     --snapshotter) snapshotter=$2; shift 2 ;;
     --keep) keep=1; shift ;;
     --timeout) timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -99,8 +99,8 @@ for _ in $(seq 1 60); do
   kubectl -n kube-system get deployment coredns >/dev/null 2>&1 && break
   sleep 2
 done
-kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s" || true
-kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s || true
+kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s"
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s
 kubectl get pods -A -o wide
 
 echo "== A test pod"
@@ -125,7 +125,7 @@ echo "== Control plane overhead (whole container, idle)"
 echo "== Log lines worth reading (storage, snapshotter, cgroups)"
 "${docker[@]}" logs "$name" 2>&1 \
   | grep -iE 'rootfs|snapshotter.*(fail|error)|overlay.*(fail|error)|cadvisor.*(fail|error)|cgroup.*(fail|error)' \
-  | grep -viE 'level=info|deprecated' | head -n 30 || echo "none"
+  | grep -viE 'level=info|deprecated|failed to read (memory|cpu)' | head -n 30 || echo "none"
 
 echo
 echo "The trial node worked. A 'failed to get rootfs info' line above means the kubelet cannot"

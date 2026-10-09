@@ -23,8 +23,11 @@ Contents: [Status](#status) · [How it works](#how-it-works) · [Security postur
 ## Status
 
 Version 0.1.0, the first release. Pinned: k3s `v1.36.5+k3s1`, ARC charts `0.15.0`, runner
-`2.338.0`, Swift `6.4.0`, Squid 6 (`ubuntu/squid:6.6-24.04_edge`), Helm `3.22.0`; every image by
-digest.
+`2.338.0`, Swift `6.4.0`, Squid 6 (`ubuntu/squid:6.6-24.04_edge`), Helm `3.22.0`. Every image this
+repository starts itself (compose services, CI, the scripts' test images, the runner images'
+base) is pinned by digest; the runner images in `helm/` are tag placeholders until you pin your
+build's digest, the controller and listener images follow the chart version, and k3s's bundled
+images follow the k3s release.
 
 **Verified by this repository's CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a
 GitHub-hosted Ubuntu 24.04 runner (2 CPUs and 8 GB for a private repository, Docker 28 with
@@ -41,11 +44,17 @@ cgroup v2 on ext4):
   `helm` service through the proxy and its pod running, the controller pod compliant with Pod
   Security `restricted`, both runner pod templates admitted by `restricted` and a privileged pod
   refused;
+- the k3s container idles at about 0.5 GiB of memory with no workloads (`trial.sh` on the
+  hosted runner);
+- the kubelet changing host-wide kernel settings ([Security posture](#security-posture)):
+  `trial.sh` on the hosted runner reported `vm.overcommit_memory` 0 → 1, `kernel.panic` -1 → 10
+  and `kernel.panic_on_oops` 0 → 1;
 - egress from a pod shaped like a runner (uid 1001, restricted, the cache claim mounted): the
   cache is writable; HTTPS to github.com through the proxy works; the proxy refuses a link-local
   and a private address; cluster DNS works; the internet without the proxy is unreachable; a port
   on the host behind the stack network's gateway is reachable from a plain container on that
-  network but not from the pod (the NetworkPolicy).
+  network but not from the pod (the NetworkPolicy; the plain container is the control). Without
+  the proxy the pod reaches nothing on the internet, which the internal network alone explains.
 
 **Not verified, because a hosted runner cannot show it.** Each is a documented step in the
 [Quick start](#quick-start) or [Operations](#operations), not an assumption:
@@ -65,6 +74,10 @@ cgroup v2 on ext4):
 - **How scale-set runners appear in GitHub's REST API** (their names and labels), which the
   example workflow's routing job relies on. Check after the first deploy
   ([Quick start](#quick-start), step 11).
+- Egress details beyond those checks: that only ports 80 and 443 pass the proxy, that a public
+  name resolving to a private address is refused, pod-to-pod isolation, and whether pods can
+  resolve public names (CoreDNS has no reachable upstream on the internal network, so they should
+  not; the proxy resolves for them).
 - Whether a GitHub App owned by a personal account (rather than an organisation) works for
   repository-level registration; GitHub documents organisation-owned apps only.
 
@@ -148,17 +161,19 @@ sets on start, for the whole host: `vm.overcommit_memory=1`, `vm.panic_on_oom=0`
 oops reboots the host after 10 seconds. `preflight.sh` shows your current values and `trial.sh`
 reports any it changed. If you need yours kept, set them on the host as the kubelet wants them,
 or put `--protect-kernel-defaults` in `K3S_EXTRA_ARGS` to make the kubelet refuse to start rather
-than change them. kube-proxy would also raise the host's `nf_conntrack_max`; the compose file
-turns that off.
+than change them. kube-proxy would also try to set the host-wide `nf_conntrack_max`, which the
+kernel refuses from a container's network namespace (the k3d FAQ's `nf_conntrack_max: permission
+denied`); the compose file tells it not to. `trial.sh` watches only the six kubelet settings above;
+other host-wide writes by a privileged node are possible.
 
 **The point of the design is that jobs never run as the node.** A job runs in a pod under it, and
 the pod boundary is what a job sees:
 
 | | A job in a runner pod |
 |---|---|
-| User | uid 1001, no capabilities (`drop: [ALL]`), `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`. The images have no `sudo`. `arc-runners` enforces Pod Security `restricted`, so the API server refuses a pod template that loosens any of this. |
+| User | uid 1001, no capabilities (`drop: [ALL]`), `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`. The images have no `sudo`. `arc-runners` enforces Pod Security `restricted`, so the API server refuses a runner pod that runs as root, keeps capabilities other than `NET_BIND_SERVICE`, allows privilege escalation, lacks a seccomp profile or mounts a hostPath; the refusal shows when the controller creates the pod, in the controller's log and the namespace's events, not at `helm install`. (`restricted` does not pin the uid to 1001.) |
 | Files | its image, its job's empty workspace, the cache claim. Nothing else from the node or the host; the host's Docker socket is mounted nowhere. |
-| Network | the proxy (public addresses on ports 80 and 443) and cluster DNS. Not the LAN, not the host's ports through the stack network's gateway, not other pods. It can reach the node's own ports (the API server, the kubelet): Kubernetes always allows pod-to-own-node traffic. |
+| Network | the proxy (public addresses on ports 80 and 443) and cluster DNS. Not the LAN, not the host's ports through the stack network's gateway, not other pods. Assume it can reach the node's own ports (the API server, the kubelet): the Kubernetes documentation says traffic between a pod and its own node is always allowed. (In this repository's smoke test the API server's service address was not reachable from a runner-like pod; do not rely on that.) |
 | Kubernetes API | nothing: no service account token is mounted, and the runner's service account has no permissions. |
 | Credentials | its single-use registration, and the job's `GITHUB_TOKEN` with the permissions the workflow grants. Not the scale set's GitHub credential, which is in a Secret the pod cannot read. |
 
@@ -193,8 +208,9 @@ Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 ## Requirements
 
 - **Docker Engine 27 or later with Docker Compose v2** (2.24 or later), rootful, able to run
-  privileged containers. A user-namespace-remapped daemon works (the node opts out); rootless
-  Docker does not.
+  privileged containers. A user-namespace-remapped daemon should work (the node opts out with
+  `userns_mode: host`; untested); rootless Docker does not. CI runs on Docker 28 and Compose 2.38;
+  27 and 2.24 are the oldest versions whose features the compose file uses, not tested ones.
 - **cgroup v2** (the unified hierarchy) with the `cpu`, `memory`, `pids` and `cpuset` controllers.
 - **A kernel with overlayfs** and the `br_netfilter` and `nf_conntrack` modules, and Docker's
   `overlay2` storage driver. The node's containerd mounts overlayfs on a Docker volume.
@@ -228,8 +244,9 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
    git clone https://github.com/OWNER/arc-on-nas.git ci && cd ci
    ```
 2. **Pre-flight checks.** Prints facts about the kernel, cgroups, Docker, storage, free resources
-   and the stack subnet; changes nothing (its overlayfs test creates and removes a throwaway
-   volume). Fix every `FAIL`.
+   and the stack subnet; changes nothing persistent (its overlayfs test runs a throwaway privileged
+   container on a throwaway volume, removes both, and leaves the small `alpine` image it pulled).
+   Fix every `FAIL`.
    ```sh
    scripts/preflight.sh
    ```
@@ -293,7 +310,9 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
     docker compose exec k3s kubectl -n arc-runners get pods            # one swift-...-runner-... Running
     ```
     The repository's Settings → Actions → Runners now lists the scale set `swift` with one idle
-    runner. Repeat with `ubuntu` and `helm/ubuntu.yaml` if you want the generic set.
+    runner. Repeat with `ubuntu` and `helm/ubuntu.yaml` if you want the generic set for the same
+    repository (it shares that repository's cache claim); a set for another repository needs its
+    own claim ([Adding a repository](#adding-a-repository)).
 11. **Point a workflow at it:** `runs-on: swift`. [`examples/workflow.yml`](examples/workflow.yml)
     is a complete workflow that routes to the scale set when a runner is online and to
     GitHub-hosted runners otherwise. Before relying on its routing, check how GitHub lists the
@@ -312,13 +331,14 @@ capacity; `preflight.sh` prints both):
 ```
 allocatable    A = what the runner pods and the system pods may request, all at once
 kube-reserved  K = the control plane: 500m CPU, 1536Mi (from k3s's measured 1.6 GB)
-system-reserved  = C - A - K   (CPU),   M - A - K - 100Mi   (memory)
+system-reserved  = C - A - K   (CPU and memory alike)
 K3S_CPUS       >= A + K, plus headroom
 K3S_MEMORY     >  A + K + headroom      (never less: see below)
 maxRunners × pod size + system pods (~0.6 CPU, ~0.7 GiB) <= A
 ```
 
-The memory rule is strict. The kubelet computes evictions from the host's memory, not the
+k3s's kubelet sets no memory eviction threshold, so nothing else is subtracted (the smoke test's
+node reported exactly capacity minus both reservations). The memory rule is strict. The kubelet computes evictions from the host's memory, not the
 container's limit, so it never evicts to protect `K3S_MEMORY`. If the pods' limits plus the
 control plane exceed it, the kernel's OOM killer acts inside the container, and it may pick k3s
 itself (which restarts; running jobs fail).
@@ -331,7 +351,7 @@ about 15 GiB kept for everything else:
 | Capacity | 16 | 32768Mi |
 | `K3S_SYSTEM_RESERVED` | 6500m | 17664Mi |
 | `K3S_KUBE_RESERVED` | 500m | 1536Mi |
-| Allocatable | 9 | 13468Mi (13.1 GiB) |
+| Allocatable | 9 | 13568Mi (13.25 GiB) |
 | `swift`: `maxRunners: 4` × 2 CPU, 3 GiB | 8 | 12 GiB |
 | System pods (CoreDNS, metrics-server, controller, two listeners) | ~0.6 | ~0.7 GiB |
 | `K3S_CPUS` / `K3S_MEMORY` (hard caps) | 10 | 17 GiB |
@@ -377,7 +397,7 @@ repositories.
   |---|---|---|
   | GitHub App | Administration: read and write; Metadata: read-only | Self-hosted runners: read and write; Metadata: read-only |
   | Personal access token (classic) | `repo` | `admin:org` |
-  | Fine-grained personal access token | Administration: read and write | Self-hosted runners: read and write |
+  | Fine-grained personal access token | Administration: read and write | Administration: read; Self-hosted runners: read and write |
 
   The documented GitHub App path starts with "Create a GitHub App that is owned by an
   organization". Enterprise-level scale sets need a classic token.
@@ -475,7 +495,8 @@ either way.
 
 **Cache pruning.** The cache only grows. [`scripts/prune-cache.sh`](scripts/prune-cache.sh) lists
 (or with `--apply` deletes) entries two levels down, such as `swiftpm-build/<package>`, in which
-nothing changed for 30 days. Schedule it weekly with the host's task scheduler, as root:
+nothing changed for 30 days. It refuses a directory not owned by uid 1001, so a mistyped path
+(a pool's root, say) is not pruned. Schedule it weekly with the host's task scheduler, as root:
 `scripts/prune-cache.sh --days 30 --apply /path/to/ci-cache/default`. Emptying the cache entirely
 is safe at any time no job runs; the next builds are cold. [`scripts/warm.sh`](scripts/warm.sh)
 starts a consumer's workflow by hand to warm it again (the example workflow also runs weekly).
@@ -515,7 +536,7 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
 
 | Symptom | Likely cause and fix |
 |---|---|
-| `docker compose up`: "Pool overlaps with other one on this address space" | Another network uses `172.31.250.0/24`. Change the subnet in the files listed at the top of `docker-compose.yml`; `scripts/check-consistency.sh` confirms. |
+| `docker compose up`: "Pool overlaps with other one on this address space" | Another network uses `172.31.250.0/24`. Change the subnet and the fixed addresses in the files listed at the top of `docker-compose.yml`; `scripts/check-consistency.sh` checks the copies it knows about. |
 | The node stays `NotReady`; k3s logs "failed to get rootfs info" or overlayfs/snapshotter errors | The storage under Docker's volumes (often ZFS or btrfs). Try `K3S_SNAPSHOTTER=native` in `.env` and `docker compose up -d`; test first with `scripts/trial.sh --snapshotter native`. |
 | System pods stuck in `ContainerCreating` / `ErrImagePull` | Image pulls fail through the proxy. Check the proxy log for `TCP_DENIED`, the host's DNS, and that the proxy is running. |
 | k3s logs "too many open files" or inotify errors | Raise `fs.inotify.max_user_watches` and `max_user_instances` on the host ([Requirements](#requirements)). |

@@ -11,8 +11,8 @@
 #
 # Addresses on the stack network are fixed because pods cannot resolve Docker's container names.
 # If 172.31.250.0/24 collides with something on your host, change it here and in squid.conf,
-# manifests/networkpolicy-runners.yaml and helm/*.yaml; scripts/check-consistency.sh checks that
-# they agree.
+# manifests/networkpolicy-runners.yaml, helm/*.yaml, scripts/preflight.sh and
+# .github/workflows/ci.yml; scripts/check-consistency.sh checks that they agree.
 
 name: ci
 
@@ -39,8 +39,8 @@ services:
     #   container's only interface. The address must match ipv4_address below.
     # --disable=traefik,servicelb: nothing here is served to the network; both would only use memory.
     # --disable-helm-controller: charts are installed with the `helm` service below, not by k3s.
-    # --kube-proxy-arg=conntrack-max-per-core=0: kube-proxy would otherwise raise the host's
-    #   nf_conntrack_max, a host-wide setting, from inside the container.
+    # --kube-proxy-arg=conntrack-max-per-core=0: kube-proxy would otherwise try to set the host-wide
+    #   nf_conntrack_max, which the kernel refuses from a container's network namespace.
     # --kubelet-arg=*-reserved: the kubelet sees the whole host, not this container's caps; the
     #   reservations shrink what it admits to fit inside them (README, "Sizing").
 
@@ -53,8 +53,10 @@ services:
     cgroup: private
     # If the Docker daemon remaps user namespaces, a privileged container must opt out of it.
     userns_mode: host
+    # The node's name; with /etc/rancher persisted, a recreated container is the same node.
     hostname: ci-node
     restart: unless-stopped
+    # Time for k3s to stop its pods before Docker kills the container.
     stop_grace_period: 60s
     labels:
       # Watchtower, if you run it, must not update this container: updates are deliberate.
@@ -73,6 +75,7 @@ services:
     # No swap for the cluster: memory.swap.max equal to the limit means none.
     memswap_limit: ${K3S_MEMORY:-17g}
     cpu_shares: ${K3S_CPU_SHARES:-256}
+    # Every process of every pod counts against this; a fork bomb in a job stops here.
     pids_limit: ${K3S_PIDS_LIMIT:-32768}
     environment:
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
@@ -171,6 +174,7 @@ networks:
   # ports through the gateway address (README, "Security posture").
   runners:
     internal: true
+    # IPv4 only: the proxy's rules and the NetworkPolicy are written for IPv4.
     enable_ipv6: false
     driver_opts:
       # A fixed interface name (at most 15 characters), for a host firewall rule if you add one.

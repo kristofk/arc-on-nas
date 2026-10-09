@@ -28,6 +28,27 @@ for f in helm/swift.yaml helm/ubuntu.yaml; do
 done
 node=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
 grep -q -- "--node-ip=$node$" docker-compose.yml || problem "docker-compose.yml: --node-ip is not the k3s service's ipv4_address $node"
+grep -q "^subnet=$subnet$" scripts/preflight.sh || problem "scripts/preflight.sh: subnet is not $subnet"
+grep -q "NO_PROXY: .*,$subnet," docker-compose.yml || problem "docker-compose.yml: NO_PROXY does not include $subnet"
+gateway=$(sed -n 's/^ *gateway: *\([0-9.]*\).*/\1/p' docker-compose.yml)
+grep -q "PROXY: http://$proxy:3128$" .github/workflows/ci.yml || problem ".github/workflows/ci.yml: PROXY is not http://$proxy:3128"
+grep -q "GATEWAY: $gateway$" .github/workflows/ci.yml || problem ".github/workflows/ci.yml: GATEWAY is not $gateway"
+
+# The cache: the compose mount target, the PersistentVolume's path, the claim the values mount.
+# shellcheck disable=SC2016 # a literal ${CACHE_DIR...} in the compose file
+mount=$(sed -n 's/^ *- \${CACHE_DIR[^}]*}:\(\/[^ ]*\).*/\1/p' docker-compose.yml)
+grep -q "path: $mount/" manifests/cache.yaml || problem "manifests/cache.yaml: hostPath is not under the compose mount $mount"
+claim=$(awk '/^kind: PersistentVolumeClaim/ {f=1} f && /^  name:/ {print $2; exit}' manifests/cache.yaml)
+for f in helm/swift.yaml helm/ubuntu.yaml; do
+  grep -q "claimName: $claim$" "$f" || problem "$f: claimName is not $claim"
+  grep -q "mountPath: /home/runner/cache$" "$f" || problem "$f: the cache is not mounted at /home/runner/cache"
+  grep -q "runAsUser: 1001$" "$f" || problem "$f: runAsUser is not 1001"
+  grep -q "name: arc-gha-rs-controller$" "$f" || problem "$f: controllerServiceAccount is not arc-gha-rs-controller (release arc)"
+done
+for f in images/swift/Dockerfile images/ubuntu/Dockerfile; do
+  grep -q "^USER 1001$" "$f" || problem "$f: USER is not 1001"
+done
+
 grep -q "^image=$k3s_image$" scripts/trial.sh || problem "scripts/trial.sh: image differs from docker-compose.yml"
 
 # The chart version: helm/controller.yaml's install command is the source of truth.

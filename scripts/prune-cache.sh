@@ -10,18 +10,23 @@
 # user that may delete the runner's files (root, or uid 1001), for example weekly from the host's
 # task scheduler. Deleting anything here only costs a slower (cold) build.
 #
-# Usage: scripts/prune-cache.sh [--days 30] [--apply] CACHE_DIR/<claim directory>
+# It refuses a directory that is not owned by uid 1001 (the runner, as the Quick start creates
+# claim directories), so a mistyped path is not pruned; --force overrides that.
+#
+# Usage: scripts/prune-cache.sh [--days 30] [--apply] [--force] CACHE_DIR/<claim directory>
 #   e.g. scripts/prune-cache.sh --days 30 --apply /path/to/ci-cache/default
 set -euo pipefail
 
 days=30
 apply=0
+force=0
 dir=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --days) days=$2; shift 2 ;;
+    --days) days=${2:-}; shift $(( $# > 1 ? 2 : 1 )) ;;
     --apply) apply=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --force) force=1; shift ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     -*) echo "unknown argument: $1" >&2; exit 2 ;;
     *) dir=$1; shift ;;
   esac
@@ -31,6 +36,10 @@ case "$days" in ''|*[!0-9]*) echo "--days must be a whole number" >&2; exit 2 ;;
 dir=$(cd "$dir" && pwd -P)
 # Refuse anything that is obviously not a cache directory.
 case "$dir" in /|/bin|/boot|/dev|/etc|/home|/lib|/proc|/root|/run|/sys|/usr|/var) echo "Refusing to prune $dir" >&2; exit 2 ;; esac
+if [ "$(stat -c %u "$dir")" != 1001 ] && [ "$force" -eq 0 ]; then
+  echo "Refusing: $dir is not owned by uid 1001, so it does not look like a cache claim directory (--force to prune anyway)." >&2
+  exit 2
+fi
 
 total=0
 while IFS= read -r -d '' entry; do

@@ -18,7 +18,7 @@ while [ $# -gt 0 ]; do
     --repo) repo=$2; shift 2 ;;
     --workflow) workflow=$2; shift 2 ;;
     --ref) ref=$2; shift 2 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

@@ -7,8 +7,10 @@ Security tab (private vulnerability reporting). Do not open a public issue. Incl
 found, how to reproduce it, and what it lets an attacker do.
 
 In scope: anything in this repository that makes the stack less safe than the README's "Security
-posture" section says, for example a way for a job in a runner pod to reach the host, the node,
-the LAN, the GitHub credential or the Kubernetes API, or a default that exposes something.
+posture" section says, for example a way for a job in a runner pod to reach the host, the LAN,
+other pods, the GitHub credential or the Kubernetes API with any privilege, or a default that
+exposes something. (That a pod can open a connection to its own node's ports is documented
+Kubernetes behaviour, not a finding by itself.)
 
 Out of scope here (report them upstream): vulnerabilities in k3s, Kubernetes, the Actions Runner
 Controller, the GitHub Actions runner, Squid or Docker themselves.
@@ -19,7 +21,9 @@ Controller, the GitHub Actions runner, Squid or Docker themselves.
   which makes the container equivalent to root on the host: every capability, every device, no
   seccomp or AppArmor confinement, a writable `/proc/sys`. Jobs do not run as the node; they run
   in pods under it, as an unprivileged user with no capabilities, under Pod Security `restricted`,
-  without Kubernetes API access, and with egress only through the proxy. A kernel exploit from a
+  without a Kubernetes API credential, and with network access only to the cluster DNS, the proxy
+  and (as Kubernetes always allows) their own node. Through the proxy a job can send anything it
+  can read to any public host. A kernel exploit from a
   pod, or a pod template that a person loosens, still ends at host root.
 - **The kubelet changes host-wide kernel settings** (`vm.overcommit_memory`, `vm.panic_on_oom`,
   `kernel.panic`, `kernel.panic_on_oops` and two key-quota settings) unless started with

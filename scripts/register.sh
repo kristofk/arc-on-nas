@@ -28,7 +28,7 @@ app_id=""
 installation_id=""
 key_file=""
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --token-file) token_file=$2; shift 2 ;;
