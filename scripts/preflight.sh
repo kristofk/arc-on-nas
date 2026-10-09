@@ -166,6 +166,8 @@ if [ -n "$budget_cpus$budget_gib" ]; then
       if [ -z "$budget_cpus" ] || [ -z "$budget_gib" ]; then
         fail "give both BUDGET_CPUS and BUDGET_GIB"
       else
+        # Base 10, so a leading zero is not read as octal.
+        budget_cpus=$(( 10#$budget_cpus )) budget_gib=$(( 10#$budget_gib ))
         alloc_cpu=$(( budget_cpus * 1000 - kube_cpu - head_cpu ))
         alloc_mem=$(( budget_gib * 1024 - kube_mem - head_mem ))
         if [ "$budget_cpus" -gt "$cpus" ] || [ "$(( budget_gib * 1024 ))" -gt "$memtotal" ]; then

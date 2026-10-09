@@ -58,7 +58,8 @@ cgroup v2 on ext4):
   on the host behind the stack network's gateway is reachable from a plain container on that
   network but not from the pod (the NetworkPolicy; the plain container is the control). Without
   the proxy the pod reaches nothing on the internet, which the internal network alone explains.
-- the proxy's health check: it passes, and it rotates Squid's access log once the log passes 10 MB.
+- the proxy's health check: it passes, and its command, run by hand on an access log padded past
+  10 MB, rotates the log.
 
 **Not verified, because a hosted runner cannot show it.** Each is a documented step in the
 [Quick start](#quick-start) or [Operations](#operations), not an assumption:
@@ -625,13 +626,15 @@ acl lan_mirror_port port 8080
 http_access allow runners lan_mirror lan_mirror_port
 ```
 
-then `docker compose up -d --force-recreate proxy`. Every job can then reach that host and port,
-so you are opening that part of the LAN to every job. Not tested in CI.
+then `docker compose up -d --force-recreate proxy`. For a mirror on port 80 or 443, leave out the
+port line and its name in the rule. Every job can then reach that host and port, so you are
+opening that part of the LAN to every job. Not tested in CI.
 
 **Why a denylist of private ranges, not an allowlist of GitHub's hosts?** Jobs download from
 package registries (SwiftPM, npm, PyPI, crates.io, container registries) that no fixed list
 covers, so an allowlist breaks builds. What the proxy protects is the host and the LAN; what jobs
-contact on the internet is in its access log. If your jobs need only a few hosts, add a
+contact on the internet is in its access log (the most recent 10 to 20 MB of it: `squid.conf`).
+If your jobs need only a few hosts, add a
 `dstdomain` allowlist to `squid.conf`.
 
 **Does it run on arm64?** Not as written: the Swift image downloads the x86_64 toolchain, and

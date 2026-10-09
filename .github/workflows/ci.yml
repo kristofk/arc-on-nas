@@ -275,8 +275,9 @@ jobs:
           check=$(docker inspect --format '{{index .Config.Healthcheck.Test 1}}' "$(docker compose ps -q proxy)")
           docker compose exec -T -u proxy proxy sh -c "yes 'padding past the rotation size' | head -c 11000000 >> $log"
           docker compose exec -T proxy sh -c "$check"
+          # The rotation is a signal to Squid: wait until it has renamed the log and opened a new one.
           for _ in $(seq 1 10); do
-            docker compose exec -T proxy test -e "$log.0" && break
+            docker compose exec -T proxy test -e "$log.0" && docker compose exec -T proxy test -e "$log" && break
             sleep 1
           done
           old=$(docker compose exec -T proxy stat -c %s "$log.0")
