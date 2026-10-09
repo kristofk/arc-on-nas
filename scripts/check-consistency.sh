@@ -68,8 +68,10 @@ runner=${base#*:}
 runner=${runner%%@*}
 swift=$(sed -n 's/^ARG SWIFT_VERSION=//p' images/swift/Dockerfile)
 echo "runner $runner, swift $swift"
-grep -q "image: ghcr.io/OWNER/arc-runner-swift:$swift-$runner" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
-grep -q "image: ghcr.io/OWNER/arc-runner-ubuntu:$runner" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
+# Any owner, and the digest you pin after building (README, "Quick start" step 8) or none yet.
+image_re() { echo "^ *image: ghcr\.io/[^/ ]+/arc-runner-$1:${2//./\\.}(@sha256:[0-9a-f]{64})?$"; }
+grep -qE "$(image_re swift "$swift-$runner")" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
+grep -qE "$(image_re ubuntu "$runner")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)

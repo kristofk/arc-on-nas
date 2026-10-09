@@ -1,6 +1,8 @@
-# Nothing may connect to the controller or the listeners. Neither serves anything (metrics are off
-# in helm/controller.yaml), and keeping runner pods away from the pods that hold the scale set's
-# GitHub credential is the point. The kubelet's probes come from the node and are always allowed.
+# Nothing may connect to the controller or the listeners. Neither serves anything (metrics are not
+# enabled: the chart's default, which helm/controller.yaml leaves alone), and keeping runner pods
+# away from the pods that hold the scale set's GitHub credential (the controller, and the listeners
+# with the copy of it the controller mirrors into this namespace) is the point. The kubelet's
+# probes come from the node and are always allowed.
 # Egress is left open: the controller and listeners need the API server and the proxy, and the
 # stack network gives them no other way out.
 apiVersion: networking.k8s.io/v1

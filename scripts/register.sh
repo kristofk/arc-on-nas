@@ -4,7 +4,9 @@
 # The credential is read from a file or typed at a prompt, never taken as an argument (arguments
 # end up in shell history and in the process list). It travels on standard input into the k3s
 # container and is stored only in the cluster, as the Secret named in helm/*.yaml
-# (githubConfigSecret). Running it again replaces the Secret.
+# (githubConfigSecret); ARC's controller mirrors it into arc-systems for each scale set's listener.
+# Running it again replaces the Secret. Server-side apply, so the object carries no
+# last-applied-configuration annotation with a second copy of the credential.
 #
 # A personal access token (key github_token):
 #   scripts/register.sh                        prompts for the token
@@ -31,12 +33,12 @@ key_file=""
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --token-file) token_file=$2; shift 2 ;;
-    --app-id) app_id=$2; shift 2 ;;
-    --installation-id) installation_id=$2; shift 2 ;;
-    --private-key-file) key_file=$2; shift 2 ;;
-    --name) name=$2; shift 2 ;;
-    --namespace) namespace=$2; shift 2 ;;
+    --token-file) token_file=${2:?--token-file needs a value}; shift 2 ;;
+    --app-id) app_id=${2:?--app-id needs a value}; shift 2 ;;
+    --installation-id) installation_id=${2:?--installation-id needs a value}; shift 2 ;;
+    --private-key-file) key_file=${2:?--private-key-file needs a value}; shift 2 ;;
+    --name) name=${2:?--name needs a value}; shift 2 ;;
+    --namespace) namespace=${2:?--namespace needs a value}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1 (the credential is never an argument; see --help)" >&2; exit 2 ;;
   esac
@@ -61,7 +63,7 @@ if [ -n "$app_id$installation_id$key_file" ]; then
       --from-literal=github_app_installation_id="$installation_id" \
       --from-file=github_app_private_key=/dev/stdin \
       --dry-run=client -o yaml < "$key_file" \
-    | kubectl apply -f - >/dev/null
+    | kubectl apply --server-side --force-conflicts -f - >/dev/null
   echo "Secret $namespace/$name holds the GitHub App's credentials."
 else
   if [ -n "$token_file" ]; then
@@ -78,7 +80,7 @@ else
   printf '%s' "$token" \
     | kubectl create secret generic "$name" --namespace "$namespace" \
         --from-file=github_token=/dev/stdin --dry-run=client -o yaml \
-    | kubectl apply -f - >/dev/null
+    | kubectl apply --server-side --force-conflicts -f - >/dev/null
   unset token
   echo "Secret $namespace/$name holds the token."
 fi

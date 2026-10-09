@@ -1,5 +1,7 @@
 # arc-on-nas
 
+[![CI](https://github.com/kristofk/arc-on-nas/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kristofk/arc-on-nas/actions/workflows/ci.yml?query=branch%3Amain)
+
 Self-hosted GitHub Actions runners on a single Docker host, such as a NAS, using GitHub's
 [Actions Runner Controller](https://github.com/actions/actions-runner-controller) (ARC) on a
 one-node [k3s](https://k3s.io) cluster that runs as a Docker Compose service. Jobs run in
@@ -18,7 +20,8 @@ Contents: [Status](#status) · [How it works](#how-it-works) · [Security postur
 [Requirements](#requirements) · [Quick start](#quick-start) · [Sizing](#sizing) ·
 [Adding a toolchain](#adding-a-toolchain) · [Adding a repository](#adding-a-repository) ·
 [Building the images](#building-the-images) · [Operations](#operations) ·
-[Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [Layout](#repository-layout)
+[Troubleshooting](#troubleshooting) · [FAQ](#faq) · [Limitations](#limitations) ·
+[Layout](#repository-layout)
 
 ## Status
 
@@ -55,6 +58,7 @@ cgroup v2 on ext4):
   on the host behind the stack network's gateway is reachable from a plain container on that
   network but not from the pod (the NetworkPolicy; the plain container is the control). Without
   the proxy the pod reaches nothing on the internet, which the internal network alone explains.
+- the proxy's health check: it passes, and it rotates Squid's access log once the log passes 10 MB.
 
 **Not verified, because a hosted runner cannot show it.** Each is a documented step in the
 [Quick start](#quick-start) or [Operations](#operations), not an assumption:
@@ -154,17 +158,30 @@ the k3s process, or gets root in that container, controls the host. Treat the co
 host service. This is strictly more exposure than running each runner as an unprivileged
 container; it buys ephemeral pods, scheduler admission and the shared cache.
 
-**The kubelet changes host-wide kernel settings.** Because `/proc/sys` is writable, the kubelet
-sets on start, for the whole host: `vm.overcommit_memory=1`, `vm.panic_on_oom=0`, `kernel.panic=10`,
-`kernel.panic_on_oops=1`, `kernel.keys.root_maxkeys=1000000`, `kernel.keys.root_maxbytes=25000000`
-(Kubernetes' `setupKernelTunables`). `kernel.panic_on_oops=1` with `kernel.panic=10` means a kernel
-oops reboots the host after 10 seconds. `preflight.sh` shows your current values and `trial.sh`
-reports any it changed. If you need yours kept, set them on the host as the kubelet wants them,
-or put `--protect-kernel-defaults` in `K3S_EXTRA_ARGS` to make the kubelet refuse to start rather
-than change them. kube-proxy would also try to set the host-wide `nf_conntrack_max`, which the
-kernel refuses from a container's network namespace (the k3d FAQ's `nf_conntrack_max: permission
-denied`); the compose file tells it not to. `trial.sh` watches only the six kubelet settings above;
-other host-wide writes by a privileged node are possible.
+**The kubelet changes host-wide kernel settings, and you cannot keep yours.** Because `/proc/sys`
+is writable, the kubelet compares six settings with the values it wants and, at every start,
+writes its values over yours, for the whole host: `vm.overcommit_memory=1`, `vm.panic_on_oom=0`,
+`kernel.panic=10`, `kernel.panic_on_oops=1`, `kernel.keys.root_maxkeys=1000000`,
+`kernel.keys.root_maxbytes=25000000` (Kubernetes' `setupKernelTunables`). `--protect-kernel-defaults`
+in `K3S_EXTRA_ARGS` does not keep your values either: with it, the kubelet refuses to start unless
+the six are already set to its values. So there is no configuration of this stack that runs with
+`kernel.panic_on_oops=0`: running it means a kernel oops reboots the host after 10 seconds. The
+node sets the values again every time it starts, including after a host reboot while the stack is
+up (`restart: unless-stopped`). They stay set after `docker compose down`, until the host reboots
+or you reset them by hand. `preflight.sh` prints your current values; record them before the first
+start, and restore them after `docker compose down`:
+
+```sh
+sysctl vm.overcommit_memory vm.panic_on_oom kernel.panic kernel.panic_on_oops \
+  kernel.keys.root_maxkeys kernel.keys.root_maxbytes | tee sysctl-before.conf
+sudo sysctl -p sysctl-before.conf      # after `docker compose down`: back to the recorded values
+```
+
+`trial.sh` records them itself, restores them when run as root, and otherwise prints the
+`sudo sysctl -w` lines that restore them. kube-proxy would also try to set the host-wide
+`nf_conntrack_max`, which the kernel refuses from a container's network namespace (the k3d FAQ's
+`nf_conntrack_max: permission denied`); the compose file tells it not to. `trial.sh` watches only
+the six kubelet settings above; other host-wide writes by a privileged node are possible.
 
 **The point of the design is that jobs never run as the node.** A job runs in a pod under it, and
 the pod boundary is what a job sees:
@@ -175,7 +192,7 @@ the pod boundary is what a job sees:
 | Files | its image, its job's empty workspace, the cache claim. Nothing else from the node or the host; the host's Docker socket is mounted nowhere. |
 | Network | the proxy (public addresses on ports 80 and 443) and cluster DNS. Not the LAN, not the host's ports through the stack network's gateway, not other pods. Assume it can reach the node's own ports (the API server, the kubelet): the Kubernetes documentation says traffic between a pod and its own node is always allowed. (In this repository's smoke test the API server's service address was not reachable from a runner-like pod; do not rely on that.) |
 | Kubernetes API | nothing: no service account token is mounted, and the runner's service account has no permissions. |
-| Credentials | its single-use registration, and the job's `GITHUB_TOKEN` with the permissions the workflow grants. Not the scale set's GitHub credential, which is in a Secret the pod cannot read. |
+| Credentials | its single-use registration, and the job's `GITHUB_TOKEN` with the permissions the workflow grants. Not the scale set's GitHub credential, which is in Secrets the pod cannot read (in `arc-runners` and, mirrored for the listener, in `arc-systems`). |
 
 What stays exposed: a kernel exploit from inside a pod lands on the host, as with any container,
 but here the node it escapes into is privileged. A mistake in a pod template would be refused by
@@ -198,8 +215,10 @@ with mode 600 into a root-owned directory with mode 700, the API server is publi
 and administration happens with `docker compose exec k3s kubectl ...` on the host. Do not copy it
 off the host.
 
-**The GitHub credential** is stored only as a Kubernetes Secret, created by
-[`scripts/register.sh`](scripts/register.sh) from a file or a prompt. k3s keeps Secrets in its
+**The GitHub credential** is stored only in Kubernetes Secrets: the one
+[`scripts/register.sh`](scripts/register.sh) creates in `arc-runners` from a file or a prompt, and a
+copy the controller mirrors into `arc-systems` for each scale set's listener (so
+`kubectl get secrets -A` lists it twice). k3s keeps Secrets in its
 SQLite datastore in the `k3s-data` volume, unencrypted unless you add `--secrets-encryption` to
 `K3S_EXTRA_ARGS`; root on the host can read it either way.
 
@@ -226,7 +245,11 @@ Reporting a vulnerability: [SECURITY.md](SECURITY.md).
   the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a dataset without snapshots.
 - **Resources:** about 1.6 GB of memory for the control plane (k3s's own measurement,
   [resource profiling](https://docs.k3s.io/reference/resource-profiling)), plus what the runner
-  pods need. The examples assume a host with at least 8 cores and 16 GB to spare for CI.
+  pods need. The example sizing (`.env.example`, [Sizing](#sizing)) is for a host with 16 CPUs and
+  32 GiB that gives CI 10 CPUs and 17 GiB; on any other host, recompute it before the first `up`
+  (`preflight.sh` prints the values for a budget you give it). A useful budget starts at about 4 CPUs
+  and 8 GiB: the control plane, the system pods and the headroom take about 1.6 CPUs and 4.5 GiB of
+  it, which leaves room for one `swift` pod.
 - **The stack subnet** `172.31.250.0/24` must not collide with another Docker network or a route
   on the host (`preflight.sh` checks).
 - Outbound HTTPS to GitHub (the hosts in GitHub's
@@ -241,7 +264,7 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
 
 1. **Clone.**
    ```sh
-   git clone https://github.com/OWNER/arc-on-nas.git ci && cd ci
+   git clone https://github.com/kristofk/arc-on-nas.git ci && cd ci
    ```
 2. **Pre-flight checks.** Prints facts about the kernel, cgroups, Docker, storage, free resources
    and the stack subnet; changes nothing persistent (its overlayfs test runs a throwaway privileged
@@ -260,12 +283,15 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
    ```
 4. **Directories and settings.** The cache directory and its first claim directory, owned by the
    runner (uid and gid 1001); the kubeconfig directory, root-owned with mode 700; `.env` from the
-   example, with `CACHE_DIR` and the sizing from [Sizing](#sizing).
+   example, with `CACHE_DIR` and the sizing for your host. The example's sizing is for a 16-CPU,
+   32 GiB host; replace its four `K3S_*` sizing lines with the ones `preflight.sh` prints for the
+   budget you give CI ([Sizing](#sizing)).
    ```sh
    sudo install -d -o 1001 -g 1001 -m 750 /path/to/ci-cache/default
    sudo install -d -o 0 -g 0 -m 700 kubeconfig
+   BUDGET_CPUS=4 BUDGET_GIB=8 scripts/preflight.sh    # prints the K3S_* lines for that budget
    cp .env.example .env && chmod 600 .env && "${EDITOR:-vi}" .env
-   scripts/preflight.sh            # now also checks CACHE_DIR and kubeconfig/
+   scripts/preflight.sh            # now also checks .env's sizing, CACHE_DIR and kubeconfig/
    ```
 5. **Bring the stack up** and wait for the node. The first start pulls k3s's system images
    through the proxy.
@@ -289,8 +315,12 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
    ```sh
    scripts/register.sh
    ```
-8. **The runner image.** Build it with [`images.yml`](.github/workflows/images.yml) in your copy of
-   this repository (push a tag `v*`, or `gh workflow run Images`), then put the printed
+8. **The runner image.** Build it in a GitHub repository of your own: fork this repository (or
+   push your clone to a new repository of yours), and enable Actions there (GitHub disables a
+   fork's workflows until you do, on its Actions tab). Then run
+   [`images.yml`](.github/workflows/images.yml) in it (push a tag `v*`, or
+   `gh workflow run Images --repo OWNER/arc-on-nas`); it pushes to your account's packages on
+   `ghcr.io` with the `packages: write` permission it declares. Put the printed
    `image@sha256:...` into `helm/swift.yaml` (and `helm/ubuntu.yaml`), replacing `OWNER`. If the
    package is private, see [Building the images](#building-the-images).
 9. **The controller.**
@@ -344,7 +374,7 @@ control plane exceed it, the kernel's OOM killer acts inside the container, and 
 itself (which restarts; running jobs fail).
 
 Example, the defaults in `.env.example`, for a host reporting 16 CPUs and 32 GiB with 4 cores and
-about 15 GiB kept for everything else:
+about 15 GiB kept for everything else (a budget of 10 CPUs and 17 GiB for CI):
 
 | | CPU | Memory |
 |---|---|---|
@@ -356,6 +386,14 @@ about 15 GiB kept for everything else:
 | System pods (CoreDNS, metrics-server, controller, two listeners) | ~0.6 | ~0.7 GiB |
 | `K3S_CPUS` / `K3S_MEMORY` (hard caps) | 10 | 17 GiB |
 | Left to the host at full CI load / when CI is idle | 6 / 16 | 15 GiB / all |
+
+`preflight.sh` does this arithmetic for your host: give it the budget, and it prints the four
+`K3S_*` sizing lines for `.env`, with the example's headroom (0.5 CPU and 2.25 GiB above
+allocatable plus `kube-reserved`). With a `.env`, it also checks the sizing against the host.
+
+```sh
+BUDGET_CPUS=10 BUDGET_GIB=17 scripts/preflight.sh    # on the example host: the values above
+```
 
 The `ubuntu` set (1 CPU, 2 GiB per pod) shares the same allocatable: when the Swift pods fill it,
 its pods wait, and the other way round. Pod sizes are a trade: 2 CPUs and 3 GiB suits a
@@ -550,6 +588,80 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
 | Builds are slow or thrash | The tools inside the pod use every host core; pass the pod's CPU count (`RUNNER_CPUS`). |
 | Jobs stop being picked up after a month | The runner image is older than 30 days behind the latest `actions/runner` release. |
 
+## FAQ
+
+**Does it run on TrueNAS SCALE, Synology DSM, Unraid, or on ZFS?** Not known: nothing here has
+run on a NAS or on ZFS yet ([Status](#status)). What the stack needs is in
+[Requirements](#requirements): rootful Docker that can run privileged containers, cgroup v2, and
+overlayfs on Docker's data root. `scripts/preflight.sh` checks those, and `scripts/trial.sh` starts
+a real node and removes it; together they are the test of a host. On ZFS, overlayfs needs
+OpenZFS 2.2 or later; if the node does not come up, retry the trial with
+`--snapshotter native`. Whether the kubelet's disk accounting works on ZFS is also unknown:
+`trial.sh` lists any `failed to get rootfs info` lines. Reports from real hosts are the most useful
+contribution ([CONTRIBUTING.md](CONTRIBUTING.md)).
+
+**Can I keep `kernel.panic_on_oops=0` on my host?** No. The kubelet sets it to 1 and
+`kernel.panic` to 10 at every start, and with `--protect-kernel-defaults` it refuses to start
+instead. Running this stack means a kernel oops reboots the host after 10 seconds
+([Security posture](#security-posture), which also gives the commands to restore your values after
+`docker compose down`).
+
+**Why a privileged Kubernetes node, rather than the runner image as plain ephemeral Docker
+containers?** Kubernetes is the only place GitHub's own autoscaler (ARC) runs, and it is what buys
+the rest: a fresh pod per job with a single-use registration, admission against fixed CPU and
+memory budgets (a job waits instead of starving the host), a shared cache volume, Pod Security
+`restricted` refusing a loosened runner template, and a NetworkPolicy that keeps jobs off the LAN.
+Plain containers would need your own scaler, registration and cleanup, but no privileged node. The
+cost is the privileged node: see [Security posture](#security-posture).
+
+**My package mirror is on the LAN, or on port 8080. How do I allow it?** There is no setting for
+it. Jobs reach only the proxy, and the proxy refuses private addresses and ports other than 80 and
+443. To allow one host, add rules to `squid.conf` above the first `http_access` line, for example
+for a mirror at `MIRROR_IP` on port 8080:
+
+```
+acl lan_mirror dst MIRROR_IP/32
+acl lan_mirror_port port 8080
+http_access allow runners lan_mirror lan_mirror_port
+```
+
+then `docker compose up -d --force-recreate proxy`. Every job can then reach that host and port,
+so you are opening that part of the LAN to every job. Not tested in CI.
+
+**Why a denylist of private ranges, not an allowlist of GitHub's hosts?** Jobs download from
+package registries (SwiftPM, npm, PyPI, crates.io, container registries) that no fixed list
+covers, so an allowlist breaks builds. What the proxy protects is the host and the LAN; what jobs
+contact on the internet is in its access log. If your jobs need only a few hosts, add a
+`dstdomain` allowlist to `squid.conf`.
+
+**Does it run on arm64?** Not as written: the Swift image downloads the x86_64 toolchain, and
+`images.yml` builds `linux/amd64` only. k3s and the runner base image exist for arm64, so the
+`ubuntu` image could be built for it too (add `linux/arm64` to `platforms` in `images.yml`).
+Untested.
+
+**How do I keep the runner image within 30 days of each `actions/runner` release without doing it
+by hand?** Nothing here does it. Watch the [actions/runner releases](https://github.com/actions/runner/releases)
+(GitHub's Watch → Custom → Releases), or configure Dependabot's `docker` ecosystem on
+`images/swift` and `images/ubuntu` in your copy to propose the new base digest; then rebuild with
+`images.yml` and pin the new digests in `helm/`. See [Operations](#operations).
+
+**Do `actions/cache`, artifacts and the `actions/setup-*` actions work?** Untested. The runner
+pods have the proxy in their environment (`https_proxy`), and GitHub's cache and artifact
+services are public HTTPS hosts, so they should pass the proxy. Actions that install system
+packages with `sudo` or `apt-get` fail: the images have no `sudo` and the pods run as uid 1001.
+Put the toolchain in the image instead ([Adding a toolchain](#adding-a-toolchain)).
+
+**Can two repositories share one cache claim?** They can technically (the same `claimName`), but do
+not: every job can write what later jobs read, so one repository's job could plant files that the
+other's build uses. Give each repository its own claim
+([Adding a repository](#adding-a-repository)). Repositories in one organisation that share a scale
+set share its claim; give those that do not trust each other separate scale sets.
+
+**What happens to a running job on `docker compose up -d` after a configuration change?** If the
+change recreates the node, every pod restarts and the running job fails. Drain first: set
+`minRunners` and `maxRunners` to 0 on each scale set and wait for its runner pods to finish
+([Operations](#operations) has the command), apply the change, then restore the scale sets.
+
 ## Limitations
 
 - **The k3s container is privileged** (see [Security posture](#security-posture)).
@@ -567,7 +679,9 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
   GitHub supports only the latest release
   ([support for ARC](https://docs.github.com/en/actions/concepts/runners/support-for-arc), which
   also excludes Kubernetes setup, template customisation and storage from GitHub's support).
-- **The kubelet sets host kernel settings** unless you use `--protect-kernel-defaults`.
+- **The kubelet sets host kernel settings,** `kernel.panic_on_oops=1` and `kernel.panic=10` among
+  them, whatever you configure; they outlive `docker compose down` until a reboot or a manual reset
+  ([Security posture](#security-posture)).
 - **The node container can reach the host's ports** through the stack network's gateway; only a
   host firewall rule closes that.
 - **x86_64 only** for the Swift image as written.

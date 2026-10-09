@@ -5,3 +5,5 @@ kubeconfig/
 *.pem
 # Charts pulled by scripts/lint.sh.
 .cache/
+# The kernel settings recorded before the first start (README, "Security posture").
+sysctl-before.conf

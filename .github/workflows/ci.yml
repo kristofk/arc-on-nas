@@ -57,7 +57,9 @@ jobs:
     name: Smoke test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Above the sum of the waits below (about 20 minutes), so a slow day ends in a wait's own error
+    # and the diagnostics; a normal run takes about 2 minutes.
+    timeout-minutes: 25
     env:
       CHART_VERSION: "0.15.0"
       CHARTS: oci://ghcr.io/actions/actions-runner-controller-charts
@@ -229,6 +231,9 @@ jobs:
           k -n arc-runners wait --for=condition=Ready pod/egress-test --timeout=180s
           run() { k -n arc-runners exec egress-test -- "$@"; }
           code() { run curl -sS -o /dev/null -m 15 -w '%{http_code}' "$@" || true; }
+          # For HTTPS through the proxy: the proxy's answer to CONNECT (http_code stays 000 when
+          # the tunnel is refused, as it does when the proxy is down or the request times out).
+          connect_code() { run curl -sS -o /dev/null -m 15 -w '%{http_connect}' "$@" || true; }
 
           run sh -c 'f=/home/runner/cache/smoke-test; echo ok > $f && cat $f && rm $f'
           echo "cache: writable as uid 1001"
@@ -237,8 +242,8 @@ jobs:
           [ "$c" = 200 ]
           c=$(code -x "$PROXY" http://169.254.169.254/); echo "link-local through the proxy: $c"
           [ "$c" = 403 ]
-          c=$(code -x "$PROXY" https://10.43.0.1/); echo "a private address through the proxy: $c"
-          [ "$c" != 200 ]
+          c=$(connect_code -x "$PROXY" https://10.43.0.1/); echo "a private address through the proxy: CONNECT $c"
+          [ "$c" = 403 ]
           # curl's exit code 6 means the name did not resolve; anything else means DNS answered.
           rc=0; run curl -sk -o /dev/null -m 5 https://kubernetes.default.svc/version || rc=$?
           echo "cluster DNS: curl exit $rc"
@@ -262,10 +267,29 @@ jobs:
           docker compose exec -T -u proxy proxy \
             grep -cE 'CONNECT (registry-1.docker.io|ghcr.io)' /var/log/squid/access.log
 
+      - name: The proxy's health check rotates its access log
+        run: |
+          set -euo pipefail
+          log=/var/log/squid/access.log
+          # The health check's own command, as docker-compose.yml defines it.
+          check=$(docker inspect --format '{{index .Config.Healthcheck.Test 1}}' "$(docker compose ps -q proxy)")
+          docker compose exec -T -u proxy proxy sh -c "yes 'padding past the rotation size' | head -c 11000000 >> $log"
+          docker compose exec -T proxy sh -c "$check"
+          for _ in $(seq 1 10); do
+            docker compose exec -T proxy test -e "$log.0" && break
+            sleep 1
+          done
+          old=$(docker compose exec -T proxy stat -c %s "$log.0")
+          new=$(docker compose exec -T proxy stat -c %s "$log")
+          echo "after the check: access.log.0 $old bytes, access.log $new bytes"
+          [ "$old" -gt 10485760 ] && [ "$new" -lt 1048576 ]
+          docker compose exec -T proxy squid -k check
+
       - name: Diagnostics
         if: failure()
         run: |
           docker compose ps -a || true
+          docker inspect --format '{{json .State.Health}}' "$(docker compose ps -aq proxy)" || true
           docker compose logs --tail 200 k3s || true
           docker compose exec -T k3s kubectl get pods -A -o wide || true
           docker compose exec -T k3s kubectl get events -A --sort-by=.lastTimestamp | tail -n 60 || true

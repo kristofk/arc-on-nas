@@ -15,9 +15,9 @@ workflow=ci.yml
 ref=main
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) repo=$2; shift 2 ;;
-    --workflow) workflow=$2; shift 2 ;;
-    --ref) ref=$2; shift 2 ;;
+    --repo) repo=${2:?--repo needs a value}; shift 2 ;;
+    --workflow) workflow=${2:?--workflow needs a value}; shift 2 ;;
+    --ref) ref=${2:?--ref needs a value}; shift 2 ;;
     -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac

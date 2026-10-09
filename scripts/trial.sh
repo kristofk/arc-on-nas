@@ -26,9 +26,9 @@ timeout=300
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --snapshotter) snapshotter=$2; shift 2 ;;
+    --snapshotter) snapshotter=${2:?--snapshotter needs a value}; shift 2 ;;
     --keep) keep=1; shift ;;
-    --timeout) timeout=$2; shift 2 ;;
+    --timeout) timeout=${2:?--timeout needs a value}; shift 2 ;;
     -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac

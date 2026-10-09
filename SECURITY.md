@@ -26,11 +26,15 @@ Controller, the GitHub Actions runner, Squid or Docker themselves.
   can read to any public host. A kernel exploit from a
   pod, or a pod template that a person loosens, still ends at host root.
 - **The kubelet changes host-wide kernel settings** (`vm.overcommit_memory`, `vm.panic_on_oom`,
-  `kernel.panic`, `kernel.panic_on_oops` and two key-quota settings) unless started with
-  `--protect-kernel-defaults`. See the README.
+  `kernel.panic`, `kernel.panic_on_oops` and two key-quota settings), and there is no way to run
+  the stack with your own values: with `--protect-kernel-defaults` the kubelet refuses to start
+  unless they are already set to its values. Running this stack means a kernel oops reboots the
+  host after 10 seconds. The values stay set after `docker compose down` until a reboot or a
+  manual reset; the README's "Security posture" section gives the commands.
 - **Use it for private repositories only.** Pull requests from forks of a public repository could
   run arbitrary code on your host.
-- **Credentials.** The GitHub credential is stored only as a Kubernetes Secret, created from a
-  file or a prompt by `scripts/register.sh`. The kubeconfig in `kubeconfig/` is a cluster-admin
+- **Credentials.** The GitHub credential is stored only in Kubernetes Secrets: the one
+  `scripts/register.sh` creates from a file or a prompt, and the copy ARC's controller mirrors
+  into `arc-systems` for each scale set's listener. The kubeconfig in `kubeconfig/` is a cluster-admin
   credential; keep it on the host. Neither ever belongs in git; `.gitignore` excludes `.env`,
   `kubeconfig/`, `*.token` and `*.pem`.
