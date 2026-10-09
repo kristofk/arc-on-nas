@@ -25,6 +25,7 @@ services:
       server
       --node-name=ci-node
       --node-ip=172.31.250.10
+      --flannel-iface=eth0
       --disable=traefik,servicelb
       --disable-helm-controller
       --snapshotter=${K3S_SNAPSHOTTER:-overlayfs}
@@ -33,8 +34,9 @@ services:
       --kube-proxy-arg=conntrack-max-per-core=0
       --write-kubeconfig-mode=600
       ${K3S_EXTRA_ARGS:-}
-    # --node-ip: k3s otherwise picks the interface of the default route, and the internal network
-    #   has none ("no default routes found"). Must match ipv4_address below.
+    # --node-ip, --flannel-iface: k3s and flannel otherwise pick the address and interface of the
+    #   default route, and the internal network has none ("no default routes found"). eth0 is the
+    #   container's only interface. The address must match ipv4_address below.
     # --disable=traefik,servicelb: nothing here is served to the network; both would only use memory.
     # --disable-helm-controller: charts are installed with the `helm` service below, not by k3s.
     # --kube-proxy-arg=conntrack-max-per-core=0: kube-proxy would otherwise raise the host's
