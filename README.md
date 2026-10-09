@@ -27,7 +27,8 @@ Version 0.1.0, the first release. Pinned: k3s `v1.36.5+k3s1`, ARC charts `0.15.0
 digest.
 
 **Verified by this repository's CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a
-GitHub-hosted Ubuntu 24.04 runner (4 CPUs, 16 GB, Docker with cgroup v2 on ext4):
+GitHub-hosted Ubuntu 24.04 runner (2 CPUs and 8 GB for a private repository, Docker 28 with
+cgroup v2 on ext4):
 
 - every static check: ShellCheck, hadolint, yamllint, actionlint, `helm lint` and `helm template`
   of both charts with the values in [`helm/`](helm), kubeconform on [`manifests/`](manifests),

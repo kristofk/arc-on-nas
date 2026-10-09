@@ -69,24 +69,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Directories and .env for a 4-CPU, 16 GB hosted runner
+      - name: Directories and .env sized for this runner
         run: |
           set -euo pipefail
           sudo install -d -o 1001 -g 1001 -m 750 "$RUNNER_TEMP/ci-cache/default"
           sudo install -d -o 0 -g 0 -m 700 kubeconfig
-          # Small caps and reservations: allocatable is about 2.5 CPUs and 4 GiB here.
+          # Hosted runners have 2 CPUs and 8 GB (private repositories) or 4 and 16 (public). Size
+          # as README "Sizing" does: allocatable 1500m CPU and 2560Mi, kube-reserved 250m and
+          # 512Mi, the rest reserved for the "host"; caps a little above allocatable + kube-reserved.
+          cpus=$(nproc)
+          mem=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
           cat > .env <<EOF
           CACHE_DIR=$RUNNER_TEMP/ci-cache
-          K3S_CPUS=3
-          K3S_MEMORY=6g
+          K3S_CPUS=$cpus
+          K3S_MEMORY=4g
           K3S_CPU_SHARES=256
           K3S_PIDS_LIMIT=32768
-          K3S_SYSTEM_RESERVED=cpu=1,memory=11Gi
-          K3S_KUBE_RESERVED=cpu=500m,memory=512Mi
+          K3S_SYSTEM_RESERVED=cpu=$(( cpus * 1000 - 1500 - 250 ))m,memory=$(( mem - 2560 - 512 - 100 ))Mi
+          K3S_KUBE_RESERVED=cpu=250m,memory=512Mi
           K3S_SNAPSHOTTER=overlayfs
           K3S_EXTRA_ARGS=
           EOF
-          sed -i 's/^ *//' .env
           cat .env
 
       - name: scripts/preflight.sh with the stack's settings

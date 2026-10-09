@@ -94,10 +94,18 @@ done
 echo "Ready after $(( $(date +%s) - start ))s"
 
 echo "== Waiting for the system pods"
-kubectl -n kube-system wait --for=condition=Ready pod --all --timeout="${timeout}s" || true
+# k3s creates its bundled components a few seconds after the node registers.
+for _ in $(seq 1 60); do
+  kubectl -n kube-system get deployment coredns >/dev/null 2>&1 && break
+  sleep 2
+done
+kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s" || true
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s || true
 kubectl get pods -A -o wide
 
 echo "== A test pod"
+# A new cluster creates the default service account a few seconds after it starts.
+for _ in $(seq 1 30); do kubectl get serviceaccount default >/dev/null 2>&1 && break; sleep 2; done
 kubectl run trial-pod --image="$pod_image" --restart=Never --command -- sh -c 'id; grep -E "^Cap(Eff|Bnd)" /proc/1/status; df -h / | tail -n 1'
 if kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/trial-pod --timeout=180s; then
   kubectl logs trial-pod
@@ -115,7 +123,9 @@ echo "== Control plane overhead (whole container, idle)"
 "${docker[@]}" stats --no-stream --format 'cpu {{.CPUPerc}}  memory {{.MemUsage}}  pids {{.PIDs}}' "$name"
 
 echo "== Log lines worth reading (storage, snapshotter, cgroups)"
-"${docker[@]}" logs "$name" 2>&1 | grep -iE 'rootfs|snapshotter|overlay|cadvisor|cgroup.*(fail|error)|failed to get' | grep -viE 'level=info' | head -n 30 || echo "none"
+"${docker[@]}" logs "$name" 2>&1 \
+  | grep -iE 'rootfs|snapshotter.*(fail|error)|overlay.*(fail|error)|cadvisor.*(fail|error)|cgroup.*(fail|error)' \
+  | grep -viE 'level=info|deprecated' | head -n 30 || echo "none"
 
 echo
 echo "The trial node worked. A 'failed to get rootfs info' line above means the kubelet cannot"
