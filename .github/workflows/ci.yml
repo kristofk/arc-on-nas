@@ -254,7 +254,9 @@ jobs:
           k -n arc-runners delete pod egress-test --wait=false
 
       - name: The proxy saw the pulls
-        run: docker compose exec -T proxy grep -cE 'CONNECT (registry-1.docker.io|ghcr.io)' /var/log/squid/access.log
+        run: |
+          docker compose exec -T -u proxy proxy \
+            grep -cE 'CONNECT (registry-1.docker.io|ghcr.io)' /var/log/squid/access.log
 
       - name: Diagnostics
         if: failure()
@@ -264,7 +266,7 @@ jobs:
           docker compose exec -T k3s kubectl get pods -A -o wide || true
           docker compose exec -T k3s kubectl get events -A --sort-by=.lastTimestamp | tail -n 60 || true
           docker compose exec -T k3s kubectl -n arc-systems describe pods || true
-          docker compose exec -T proxy tail -n 60 /var/log/squid/access.log || true
+          docker compose exec -T -u proxy proxy tail -n 60 /var/log/squid/access.log || true
 
       - name: Tear down
         if: always()

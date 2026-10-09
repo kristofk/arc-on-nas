@@ -302,7 +302,7 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
     gh api repos/OWNER/REPO/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'
     ```
     Run the workflow, then read which hosts the job contacted:
-    `docker compose exec proxy tail -n 50 /var/log/squid/access.log`.
+    `docker compose exec -u proxy proxy tail -n 50 /var/log/squid/access.log`.
 
 ## Sizing
 
@@ -511,7 +511,7 @@ run on GitHub-hosted runners if your workflow routes as the example does.
 ## Troubleshooting
 
 Start with `docker compose exec k3s kubectl get pods -A`, `docker compose logs k3s`, and the
-proxy's log (`docker compose exec proxy tail -n 100 /var/log/squid/access.log`).
+proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/access.log`).
 
 | Symptom | Likely cause and fix |
 |---|---|

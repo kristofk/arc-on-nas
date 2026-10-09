@@ -26,6 +26,8 @@ for f in helm/swift.yaml helm/ubuntu.yaml; do
   n=$(grep -c "url: http://$proxy:3128" "$f" || true)
   [ "$n" -eq 2 ] || problem "$f: expected the http and https proxy URLs to be http://$proxy:3128"
 done
+node=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
+grep -q -- "--node-ip=$node$" docker-compose.yml || problem "docker-compose.yml: --node-ip is not the k3s service's ipv4_address $node"
 grep -q "^image=$k3s_image$" scripts/trial.sh || problem "scripts/trial.sh: image differs from docker-compose.yml"
 
 # The chart version: helm/controller.yaml's install command is the source of truth.
