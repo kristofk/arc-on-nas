@@ -1,0 +1,105 @@
+# Values for the gha-runner-scale-set chart, version 0.15.0: the "ubuntu" scale set, a generic
+# runner with common build tools, for jobs that need no special toolchain. Workflows use
+# `runs-on: ubuntu`. Chart defaults:
+# https://github.com/actions/actions-runner-controller/blob/gha-runner-scale-set-0.15.0/charts/gha-runner-scale-set/values.yaml
+#
+#   docker compose run --rm helm upgrade --install ubuntu \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+#     --version 0.15.0 --namespace arc-runners -f helm/ubuntu.yaml \
+#     --set githubConfigUrl=https://github.com/OWNER/REPO
+
+githubConfigUrl: ""
+githubConfigSecret: github-credentials
+
+# The controller's service account (release "arc" in arc-systems), named explicitly so the chart
+# does not have to discover it, and so `helm template` works without a cluster.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+# No idle runner: a pod starts when a job arrives and costs nothing in between.
+minRunners: 0
+maxRunners: 2
+
+proxy:
+  http:
+    url: http://172.31.250.2:3128
+  https:
+    url: http://172.31.250.2:3128
+  noProxy:
+    - localhost
+    - 127.0.0.1
+    - 10.42.0.0/16
+    - 10.43.0.0/16
+    - kubernetes.default.svc
+    - .svc
+    - .cluster.local
+
+listenerTemplate:
+  spec:
+    securityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: listener
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+
+template:
+  spec:
+    automountServiceAccountToken: false
+    # imagePullSecrets:
+    #   - name: ghcr-pull
+    securityContext:
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        # Built from images/ubuntu/Dockerfile. Replace OWNER and pin the digest.
+        image: ghcr.io/OWNER/arc-runner-ubuntu:2.338.0
+        imagePullPolicy: IfNotPresent
+        command: ["/home/runner/run.sh"]
+        env:
+          - name: CI_CACHE
+            value: /home/runner/cache
+          - name: RUNNER_CPUS
+            value: "1"
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          # Same repository as the swift set in this example, so the same claim. A scale set for
+          # another repository gets its own claim (manifests/cache.yaml).
+          - name: cache
+            mountPath: /home/runner/cache
+    volumes:
+      - name: work
+        emptyDir: {}
+      - name: cache
+        persistentVolumeClaim:
+          claimName: ci-cache

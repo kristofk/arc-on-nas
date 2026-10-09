@@ -1,0 +1,29 @@
+# The controller and the listeners live in arc-systems; the runner pods, which run the jobs, live
+# alone in arc-runners. GitHub's ARC documentation recommends the split: "create your runner pods
+# in a different namespace than the namespace containing your operator pods".
+#
+# Pod Security admission (https://kubernetes.io/docs/concepts/security/pod-security-standards/):
+#   arc-runners  enforce "restricted": the API server refuses a runner pod that runs as root, keeps
+#                capabilities, allows privilege escalation, lacks a seccomp profile or mounts a
+#                hostPath. A mistake in a values file fails loudly instead of running.
+#   arc-systems  enforce "baseline" (no privileged pods, no host namespaces, no hostPath), warn and
+#                audit "restricted". The values in helm/ make the controller and the listeners
+#                restricted-compliant; "baseline" is enforced because the listener pod is built by
+#                the controller and only its template is under your control.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arc-systems
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arc-runners
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

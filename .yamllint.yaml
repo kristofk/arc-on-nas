@@ -1,0 +1,16 @@
+# YAML lint settings (https://yamllint.readthedocs.io).
+extends: default
+ignore: |
+  .cache/
+rules:
+  document-start: disable
+  line-length:
+    max: 120
+  # GitHub Actions' `on:` key.
+  truthy:
+    allowed-values: ["true", "false", "on"]
+    check-keys: true
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1

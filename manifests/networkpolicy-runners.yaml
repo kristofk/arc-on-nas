@@ -1,0 +1,61 @@
+# Runner pods may resolve names through the cluster DNS and talk to the egress proxy, and nothing
+# else. k3s enforces NetworkPolicy with its embedded controller; nothing to install.
+#
+# Not covered by any NetworkPolicy: traffic between a pod and its own node is always allowed
+# (https://kubernetes.io/docs/concepts/services-networking/network-policies/), so a job can reach
+# the k3s container's own ports (the API server on 6443, the kubelet on 10250). Those require
+# credentials, and the runner pods get none (no service account token).
+#
+# What this blocks that Docker's internal network alone does not: the stack network's gateway,
+# which is the host itself, and so every port the host listens on.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: arc-runners
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: arc-runners
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-proxy
+  namespace: arc-runners
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # The proxy's fixed address on the stack network (docker-compose.yml).
+        - ipBlock:
+            cidr: 172.31.250.2/32
+      ports:
+        - protocol: TCP
+          port: 3128

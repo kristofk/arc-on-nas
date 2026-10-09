@@ -1,0 +1,128 @@
+# Values for the gha-runner-scale-set chart, version 0.15.0: the "swift" scale set, an example
+# toolchain image with a warm build cache. The release name is the scale set's name and the value
+# workflows use in `runs-on: swift`. Chart defaults:
+# https://github.com/actions/actions-runner-controller/blob/gha-runner-scale-set-0.15.0/charts/gha-runner-scale-set/values.yaml
+#
+#   docker compose run --rm helm upgrade --install swift \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+#     --version 0.15.0 --namespace arc-runners -f helm/swift.yaml \
+#     --set githubConfigUrl=https://github.com/OWNER/REPO
+
+# The repository the runners register with, set on the command line above. A personal account
+# has no account-wide level: one release per repository (README, "Adding a repository").
+githubConfigUrl: ""
+
+# A Secret in arc-runners created by scripts/register.sh (key github_token, or the three
+# github_app_* keys). Never put the credential itself in a values file.
+githubConfigSecret: github-credentials
+
+# The controller's service account (release "arc" in arc-systems), named explicitly so the chart
+# does not have to discover it, and so `helm template` works without a cluster.
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+# One idle runner always waiting, so a job starts without waiting for a pod; at most four at once.
+# Four runners at 2 CPUs and 3 GiB each must fit the node's allocatable (README, "Sizing"). A pod
+# that does not fit waits as Pending, and its job waits with it.
+minRunners: 1
+maxRunners: 4
+
+# The controller (for this scale set's GitHub calls), the listener and every runner use the proxy.
+# The address is the proxy's fixed address on the stack network: pods cannot resolve Docker's
+# container names.
+proxy:
+  http:
+    url: http://172.31.250.2:3128
+  https:
+    url: http://172.31.250.2:3128
+  noProxy:
+    - localhost
+    - 127.0.0.1
+    - 10.42.0.0/16
+    - 10.43.0.0/16
+    - kubernetes.default.svc
+    - .svc
+    - .cluster.local
+
+# The listener pod (in arc-systems), made restricted-compliant. The controller merges this into
+# the pod it builds; the container must be named "listener".
+listenerTemplate:
+  spec:
+    securityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: listener
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+
+# The runner pod. No containerMode: the job runs in the runner container itself, from an image that
+# already holds the toolchain; no Docker daemon, no job containers.
+template:
+  spec:
+    # The job needs no Kubernetes API access; without a token it has none.
+    automountServiceAccountToken: false
+    # The images in images/ to pull from a private registry need a pull secret in arc-runners
+    # (README, "Building the images"):
+    # imagePullSecrets:
+    #   - name: ghcr-pull
+    securityContext:
+      # Numeric, so the kubelet can verify runAsNonRoot (the base image's USER is a name).
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        # Built from images/swift/Dockerfile by .github/workflows/images.yml. Replace OWNER, and pin
+        # the digest the workflow prints: ghcr.io/OWNER/arc-runner-swift:<tag>@sha256:<digest>
+        image: ghcr.io/OWNER/arc-runner-swift:6.4.0-2.338.0
+        imagePullPolicy: IfNotPresent
+        command: ["/home/runner/run.sh"]
+        env:
+          # Where workflows find the warm cache (examples/workflow.yml).
+          - name: CI_CACHE
+            value: /home/runner/cache
+          # The CPU limit below, for tools that size themselves to the host's core count.
+          - name: RUNNER_CPUS
+            value: "2"
+        # Requests equal limits: Guaranteed QoS, exact admission, and the kernel's OOM killer
+        # prefers other processes. Inside the pod, software still sees every host core: tell it.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 3Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        volumeMounts:
+          # The job's workspace: fresh for every job, deleted with the pod.
+          - name: work
+            mountPath: /home/runner/_work
+          # The warm cache, shared by every runner of this repository.
+          - name: cache
+            mountPath: /home/runner/cache
+    volumes:
+      - name: work
+        emptyDir: {}
+      - name: cache
+        persistentVolumeClaim:
+          claimName: ci-cache

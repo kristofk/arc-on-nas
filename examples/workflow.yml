@@ -1,0 +1,143 @@
+# An example workflow for a repository that uses the "swift" scale set: copy it to
+# .github/workflows/ci.yml in that repository and adapt the build steps.
+#
+# Where the build job runs is decided by the `route` job:
+#   - the self-hosted scale set ("runs-on: swift") when one of its runners is online;
+#   - GitHub-hosted runners (ubuntu-latest with the swift container) when none is, when the
+#     runners cannot be listed, or for a pull request from a fork.
+# The repository variable CI_RUNNER overrides that: auto (default), self-hosted or hosted.
+#   gh variable set CI_RUNNER --body hosted
+#
+# Listing runners needs a token GITHUB_TOKEN cannot have: create a fine-grained personal access
+# token for this repository only, with "Administration: Read-only", and store it as the secret
+# RUNNER_STATUS_TOKEN. Without it, every run goes to GitHub-hosted runners.
+#
+# With minRunners: 1 the scale set always has one idle runner online, so "online" means "the
+# cluster is up". A set with minRunners: 0 has no runner online while idle; route such a set with
+# CI_RUNNER alone.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly, to keep the warm cache warm when nothing was merged (scripts/warm.sh starts it by hand).
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# A job's token can only read the repository.
+permissions:
+  contents: read
+
+jobs:
+  route:
+    name: Choose the runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    # One API call with its own read-only token; no checkout, no GITHUB_TOKEN.
+    permissions: {}
+    outputs:
+      self_hosted: ${{ steps.choose.outputs.self_hosted }}
+    steps:
+      - name: Self-hosted when a runner of the scale set is online
+        id: choose
+        shell: bash
+        env:
+          MODE: ${{ vars.CI_RUNNER || 'auto' }}
+          FROM_FORK: >-
+            ${{ github.event_name == 'pull_request'
+                && github.event.pull_request.head.repo.full_name != github.repository }}
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          # The scale set's installation name (the Helm release name).
+          SCALE_SET: swift
+        # Never fails: every doubt routes to GitHub-hosted runners.
+        run: |
+          route() {
+            echo "self_hosted=$1" >> "$GITHUB_OUTPUT"
+            echo "$2"
+            exit 0
+          }
+          if [ "$FROM_FORK" = "true" ]; then
+            route false "A pull request from a fork: GitHub-hosted runners."
+          fi
+          case "$MODE" in
+            hosted) route false "CI_RUNNER=hosted: GitHub-hosted runners." ;;
+            self-hosted) route true "CI_RUNNER=self-hosted: the $SCALE_SET scale set." ;;
+            auto) ;;
+            *) echo "::warning::CI_RUNNER is '$MODE', not auto, self-hosted or hosted."
+               route false "GitHub-hosted runners." ;;
+          esac
+          if [ -z "$GH_TOKEN" ]; then
+            route false "No RUNNER_STATUS_TOKEN secret: GitHub-hosted runners."
+          fi
+          # A scale set's runners are named <scale set>-<id>-runner-<id>; match the name and, in case
+          # the API lists it, a label equal to the scale set's name.
+          if ! online=$(timeout 20 gh api "repos/$REPOSITORY/actions/runners?per_page=100" --jq \
+              "[.runners[] | select(.status == \"online\")
+                | select((.name | startswith(\"$SCALE_SET-\")) or any(.labels[]; .name == \"$SCALE_SET\"))]
+                | length"); then
+            echo "::warning::Could not list the self-hosted runners (token expired or API error)."
+            route false "GitHub-hosted runners."
+          fi
+          case "$online" in
+            '' | *[!0-9]*) route false "Unexpected answer from the API: GitHub-hosted runners." ;;
+            0) route false "No $SCALE_SET runner online: GitHub-hosted runners." ;;
+            *) route true "$online $SCALE_SET runner(s) online: the $SCALE_SET scale set." ;;
+          esac
+
+  build:
+    name: Build and test
+    needs: route
+    # Also when `route` failed: its output is then empty, which means GitHub-hosted.
+    if: ${{ !cancelled() }}
+    runs-on: ${{ needs.route.outputs.self_hosted == 'true' && 'swift' || 'ubuntu-latest' }}
+    # On the scale set the job runs in the runner image, which has Swift; an empty value means no
+    # job container. GitHub-hosted runners use the official Swift image.
+    container: ${{ needs.route.outputs.self_hosted != 'true' && 'swift:6.4' || '' }}
+    timeout-minutes: 60
+    env:
+      SELF_HOSTED: ${{ needs.route.outputs.self_hosted }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Parallelism from the CPU quota
+        id: cpus
+        # Inside a pod, nproc and Swift see every core of the host, not the pod's CPU limit. Too many
+        # compiler processes on a 2-CPU quota thrash, and do not fit its memory. Read the quota.
+        run: |
+          jobs=$(nproc)
+          if [ -r /sys/fs/cgroup/cpu.max ]; then
+            read -r quota period < /sys/fs/cgroup/cpu.max
+            if [ "$quota" != max ]; then
+              jobs=$(( (quota + period - 1) / period ))
+            fi
+          fi
+          echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
+          echo "Building with $jobs parallel jobs."
+
+      - name: Build once, tests included, then test
+        env:
+          JOBS: ${{ steps.cpus.outputs.jobs }}
+          # Swift Testing's parallelism; it also sizes itself to the host's cores otherwise.
+          SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH: ${{ steps.cpus.outputs.jobs }}
+        # On the scale set the build folder lives in the warm cache ($CI_CACHE, set by the pod
+        # template), outside the checkout, so the next job starts from it. Two jobs building into the
+        # same folder at once do not corrupt it: SwiftPM locks the folder and the second one waits.
+        run: |
+          if [ "$SELF_HOSTED" = "true" ] && [ -n "${CI_CACHE:-}" ]; then
+            scratch="$CI_CACHE/swiftpm-build/${GITHUB_REPOSITORY#*/}"
+            shared="$CI_CACHE/swiftpm-cache"
+            swift build --build-tests --jobs "$JOBS" --scratch-path "$scratch" --cache-path "$shared"
+            swift test --skip-build --scratch-path "$scratch" --cache-path "$shared"
+          else
+            swift build --build-tests --jobs "$JOBS"
+            swift test --skip-build
+          fi

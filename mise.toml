@@ -1,0 +1,11 @@
+# Tool versions for scripts/lint.sh, locally and in CI: `mise install`, then
+# `mise exec -- scripts/lint.sh`. (https://mise.jdx.dev)
+[tools]
+actionlint = "1.7.12"
+hadolint = "2.15.1"
+helm = "3.22.0"
+kubeconform = "0.8.0"
+shellcheck = "0.11.0"
+yq = "4.54.1"
+"pipx:yamllint" = "1.38.0"
+uv = "0.12.23"

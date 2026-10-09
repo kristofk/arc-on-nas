@@ -1,0 +1,7 @@
+# Local settings and anything the stack writes next to this file. None of it belongs in git.
+.env
+kubeconfig/
+*.token
+*.pem
+# Charts pulled by scripts/lint.sh.
+.cache/

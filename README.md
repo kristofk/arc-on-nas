@@ -1,0 +1,566 @@
+# arc-on-nas
+
+Self-hosted GitHub Actions runners on a single Docker host, such as a NAS, using GitHub's
+[Actions Runner Controller](https://github.com/actions/actions-runner-controller) (ARC) on a
+one-node [k3s](https://k3s.io) cluster that runs as a Docker Compose service. Jobs run in
+ephemeral pods (one pod per job, deleted afterwards), are admitted by the Kubernetes scheduler
+within fixed CPU and memory budgets so the host's other workloads keep priority, share a warm
+build cache on the host's disk, and reach the internet only through an egress proxy that refuses
+private addresses.
+
+**Who it is for:** someone with one always-on Docker host (a NAS, a home server, a small VM host)
+that already runs other services which must keep working, who wants CI jobs for their own
+private repositories to run there instead of on GitHub-hosted minutes, and who manages that host
+with Compose files rather than a Kubernetes distribution. It is not for multi-node clusters, for
+public repositories (see [Limitations](#limitations)), or for jobs that need Docker.
+
+Contents: [Status](#status) · [How it works](#how-it-works) · [Security posture](#security-posture) ·
+[Requirements](#requirements) · [Quick start](#quick-start) · [Sizing](#sizing) ·
+[Adding a toolchain](#adding-a-toolchain) · [Adding a repository](#adding-a-repository) ·
+[Building the images](#building-the-images) · [Operations](#operations) ·
+[Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [Layout](#repository-layout)
+
+## Status
+
+Version 0.1.0, the first release. Pinned: k3s `v1.36.5+k3s1`, ARC charts `0.15.0`, runner
+`2.338.0`, Swift `6.4.0`, Squid 6 (`ubuntu/squid:6.6-24.04_edge`), Helm `3.22.0`; every image by
+digest.
+
+**Verified by this repository's CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a
+GitHub-hosted Ubuntu 24.04 runner (4 CPUs, 16 GB, Docker with cgroup v2 on ext4):
+
+- every static check: ShellCheck, hadolint, yamllint, actionlint, `helm lint` and `helm template`
+  of both charts with the values in [`helm/`](helm), kubeconform on [`manifests/`](manifests),
+  on the rendered charts and on the runner and listener pods the values produce, and
+  [`scripts/check-consistency.sh`](scripts/check-consistency.sh);
+- `scripts/preflight.sh` and `scripts/trial.sh` run to completion;
+- the stack: `docker compose up` with this `docker-compose.yml`, the node `Ready` with every image
+  pulled through the proxy, the manifests applied and the cache claim bound,
+  `scripts/register.sh` storing both credential forms, the controller chart installed by the
+  `helm` service through the proxy and its pod running, the controller pod compliant with Pod
+  Security `restricted`, both runner pod templates admitted by `restricted` and a privileged pod
+  refused;
+- egress from a pod shaped like a runner (uid 1001, restricted, the cache claim mounted): the
+  cache is writable; HTTPS to github.com through the proxy works; the proxy refuses a link-local
+  and a private address; cluster DNS works; the internet without the proxy is unreachable; a port
+  on the host behind the stack network's gateway is reachable from a plain container on that
+  network but not from the pod (the NetworkPolicy).
+
+**Not verified, because a hosted runner cannot show it.** Each is a documented step in the
+[Quick start](#quick-start) or [Operations](#operations), not an assumption:
+
+- **Any NAS.** Nothing here has run on a NAS or on ZFS. `preflight.sh` and `trial.sh` are the
+  test of your host; run them first.
+- **A scale set registering with GitHub and running a job.** That needs a real credential and a
+  repository; the smoke test installs only the controller. The listener's restricted
+  security context (from `listenerTemplate`) is schema-checked but has never run, which is why
+  `arc-systems` enforces `baseline`, not `restricted`.
+- **The runner images.** [`images.yml`](.github/workflows/images.yml) builds them on a tag; it
+  has not been run. The Swift checksum is the published one for the 6.4.0 Ubuntu 24.04 tarball.
+- **The warm cache under real builds,** including SwiftPM's lock behaviour across pods and
+  `prune-cache.sh` on a real cache.
+- **The sizing numbers** in `.env.example` and [Sizing](#sizing): arithmetic from published
+  figures, not measurements on your host.
+- **How scale-set runners appear in GitHub's REST API** (their names and labels), which the
+  example workflow's routing job relies on. Check after the first deploy
+  ([Quick start](#quick-start), step 11).
+- Whether a GitHub App owned by a personal account (rather than an organisation) works for
+  repository-level registration; GitHub documents organisation-owned apps only.
+
+## How it works
+
+```
+ host (Docker)
+ ├─ ci-k3s-1   privileged; the Kubernetes node   ── stack network (internal, 172.31.250.0/24) ──┐
+ │   ├─ arc-systems   controller, one listener per scale set                                      │
+ │   └─ arc-runners   ephemeral runner pods  ── NetworkPolicy: DNS + proxy only                    │
+ │        └─ /home/runner/cache  ◄── PersistentVolume ◄── CACHE_DIR on the host                    │
+ └─ ci-proxy-1  Squid  ───────────────────────────────────────────────────────────────────────────┘
+        └─ egress network ── internet (ports 80 and 443, public addresses only)
+```
+
+**k3s as one Compose service.** [`docker-compose.yml`](docker-compose.yml) runs the official
+`rancher/k3s` image as a single server with no agents, the pattern k3s documents under
+["Running K3s in Docker"](https://docs.k3s.io/advanced). One container holds the API server, a
+SQLite datastore, the kubelet and containerd, plus what k3s bundles: CoreDNS, a NetworkPolicy
+controller, metrics-server. Traefik, ServiceLB and k3s's Helm controller are disabled. Cluster
+state lives in named Docker volumes, so `docker compose down` and host reboots keep it;
+`restart: unless-stopped` brings the node back after a reboot and the controllers recreate the
+pods. The cluster is disposable: its only state worth keeping is the GitHub credential, which you
+can create again.
+
+**The controller.** ARC's `gha-runner-scale-set-controller` chart runs in `arc-systems`. For each
+scale set it starts a *listener* pod (also in `arc-systems`) that holds a long-poll HTTPS
+connection to GitHub's Actions service; nothing connects inward, no webhook, no published port.
+
+**Ephemeral runners.** Each scale set is one release of the `gha-runner-scale-set` chart, and
+its release name is what workflows put in `runs-on:`. When a job is queued, the controller
+creates a pod in `arc-runners` with a single-use just-in-time registration; the pod runs one job
+and is deleted. `minRunners` keeps that many idle pods waiting; `maxRunners` caps concurrency.
+This repository ships two examples: `swift` (a toolchain image, `minRunners: 1`) and `ubuntu`
+(generic build tools, `minRunners: 0`). Jobs run inside the runner container itself (ARC's
+default container mode); there is no Docker daemon.
+
+**The warm cache.** A host directory (`CACHE_DIR`) is bind-mounted into the node and exposed as a
+static PersistentVolume and claim ([`manifests/cache.yaml`](manifests/cache.yaml)); every runner
+pod mounts it at `/home/runner/cache` and finds its path in `$CI_CACHE`. On one node a
+ReadWriteOnce volume can be mounted by every pod at once. Workflows keep build folders there,
+outside the job's fresh checkout, so the next job only compiles what changed. One claim per
+repository: every job can write what later jobs read.
+
+**The resource model.** Three layers:
+
+1. The k3s container's caps (`cpus`, `mem_limit`, `pids_limit`) bound the whole cluster.
+   `cpu_shares` gives it a lower CPU weight than the host's other containers, so under contention
+   they win; when the host is idle the cluster may use everything up to its cap.
+2. The kubelet sees the whole host, not the container's caps. `system-reserved` and
+   `kube-reserved` subtract enough from its capacity that what is left (*allocatable*) fits
+   inside the caps.
+3. Every pod's requests equal its limits. The scheduler admits pods against allocatable; a pod
+   that does not fit stays `Pending` and its job waits until an earlier pod finishes. Nothing
+   looks at the host's actual load: see [Limitations](#limitations).
+
+**The egress proxy.** The node sits on an `internal` Docker network, which Docker gives no route
+out. Its only way to the internet is the Squid container ([`squid.conf`](squid.conf)), the one
+container also on an outbound network. Squid forwards HTTP and HTTPS (ports 80 and 443) to public
+addresses and refuses private, loopback, link-local, carrier-grade-NAT and multicast ranges after
+resolving the name. containerd's image pulls use it (`HTTPS_PROXY` on the node); ARC sets it for
+the controller's GitHub calls, the listeners and the runners (`proxy:` in the values). Squid's
+access log lists every host contacted. A NetworkPolicy in `arc-runners` lets runner pods reach
+only the cluster DNS and the proxy.
+
+## Security posture
+
+**The k3s container is privileged, and that makes it equivalent to root on the host.** A
+Kubernetes node in a container needs it: k3s's and kind's own sources say so, and neither has a
+tested smaller set of capabilities. `privileged: true` gives the container every capability, no
+seccomp or AppArmor profile, every host device (`/dev`, so the disks), a writable `/proc/sys` and
+`/sys/fs/cgroup`, and the ability to mount filesystems and load kernel modules. Whoever controls
+the k3s process, or gets root in that container, controls the host. Treat the container like a
+host service. This is strictly more exposure than running each runner as an unprivileged
+container; it buys ephemeral pods, scheduler admission and the shared cache.
+
+**The kubelet changes host-wide kernel settings.** Because `/proc/sys` is writable, the kubelet
+sets on start, for the whole host: `vm.overcommit_memory=1`, `vm.panic_on_oom=0`, `kernel.panic=10`,
+`kernel.panic_on_oops=1`, `kernel.keys.root_maxkeys=1000000`, `kernel.keys.root_maxbytes=25000000`
+(Kubernetes' `setupKernelTunables`). `kernel.panic_on_oops=1` with `kernel.panic=10` means a kernel
+oops reboots the host after 10 seconds. `preflight.sh` shows your current values and `trial.sh`
+reports any it changed. If you need yours kept, set them on the host as the kubelet wants them,
+or put `--protect-kernel-defaults` in `K3S_EXTRA_ARGS` to make the kubelet refuse to start rather
+than change them. kube-proxy would also raise the host's `nf_conntrack_max`; the compose file
+turns that off.
+
+**The point of the design is that jobs never run as the node.** A job runs in a pod under it, and
+the pod boundary is what a job sees:
+
+| | A job in a runner pod |
+|---|---|
+| User | uid 1001, no capabilities (`drop: [ALL]`), `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`. The images have no `sudo`. `arc-runners` enforces Pod Security `restricted`, so the API server refuses a pod template that loosens any of this. |
+| Files | its image, its job's empty workspace, the cache claim. Nothing else from the node or the host; the host's Docker socket is mounted nowhere. |
+| Network | the proxy (public addresses on ports 80 and 443) and cluster DNS. Not the LAN, not the host's ports through the stack network's gateway, not other pods. It can reach the node's own ports (the API server, the kubelet): Kubernetes always allows pod-to-own-node traffic. |
+| Kubernetes API | nothing: no service account token is mounted, and the runner's service account has no permissions. |
+| Credentials | its single-use registration, and the job's `GITHUB_TOKEN` with the permissions the workflow grants. Not the scale set's GitHub credential, which is in a Secret the pod cannot read. |
+
+What stays exposed: a kernel exploit from inside a pod lands on the host, as with any container,
+but here the node it escapes into is privileged. A mistake in a pod template would be refused by
+Pod Security in `arc-runners`; `arc-systems` enforces `baseline` (no privileged pods, host
+namespaces or hostPath) and warns on anything below `restricted`. Docker's internal network does
+not stop the *node* container from reaching the host's ports through the network's gateway
+([Docker's documentation](https://docs.docker.com/reference/cli/docker/network/create/#internal));
+the NetworkPolicy blocks that path for runner pods, and a host firewall rule on the interface
+`br-ci-runners` would close it for the node too. A job can send what it can read to any public
+host through the proxy.
+
+**Public repositories: do not.** GitHub: "We recommend that you only use self-hosted runners with
+private repositories. This is because forks of your public repository can potentially run
+dangerous code on your self-hosted runner machine"
+([add runners](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)).
+Register only private repositories, and keep their "Fork pull request workflows" setting off.
+
+**The kubeconfig** in `./kubeconfig/` is a cluster-admin client certificate. It is written by k3s
+with mode 600 into a root-owned directory with mode 700, the API server is published on no port,
+and administration happens with `docker compose exec k3s kubectl ...` on the host. Do not copy it
+off the host.
+
+**The GitHub credential** is stored only as a Kubernetes Secret, created by
+[`scripts/register.sh`](scripts/register.sh) from a file or a prompt. k3s keeps Secrets in its
+SQLite datastore in the `k3s-data` volume, unencrypted unless you add `--secrets-encryption` to
+`K3S_EXTRA_ARGS`; root on the host can read it either way.
+
+Reporting a vulnerability: [SECURITY.md](SECURITY.md).
+
+## Requirements
+
+- **Docker Engine 27 or later with Docker Compose v2** (2.24 or later), rootful, able to run
+  privileged containers. A user-namespace-remapped daemon works (the node opts out); rootless
+  Docker does not.
+- **cgroup v2** (the unified hierarchy) with the `cpu`, `memory`, `pids` and `cpuset` controllers.
+- **A kernel with overlayfs** and the `br_netfilter` and `nf_conntrack` modules, and Docker's
+  `overlay2` storage driver. The node's containerd mounts overlayfs on a Docker volume.
+- **inotify limits** of at least `fs.inotify.max_user_watches=524288` and
+  `fs.inotify.max_user_instances=512`, set persistently on the host (many NAS systems have a
+  "sysctl" or "tunables" page for this). Many distributions default to 8192 and 128, which a
+  Kubernetes node outgrows.
+- **ZFS:** overlayfs on ZFS needs OpenZFS 2.2 or later
+  ([2.2.0 release notes](https://github.com/openzfs/zfs/releases/tag/zfs-2.2.0)). If your Docker
+  data root is on ZFS and Docker's `overlay2` already works there, the nested containerd should
+  too, but the kubelet's disk accounting on pseudo-devices (ZFS, btrfs) has known failure modes
+  ([kind known issues](https://kind.sigs.k8s.io/docs/user/known-issues/)). `trial.sh` is the test;
+  the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a dataset without snapshots.
+- **Resources:** about 1.6 GB of memory for the control plane (k3s's own measurement,
+  [resource profiling](https://docs.k3s.io/reference/resource-profiling)), plus what the runner
+  pods need. The examples assume a host with at least 8 cores and 16 GB to spare for CI.
+- **The stack subnet** `172.31.250.0/24` must not collide with another Docker network or a route
+  on the host (`preflight.sh` checks).
+- Outbound HTTPS to GitHub (the hosts in GitHub's
+  [self-hosted runner reference](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)),
+  `ghcr.io` and Docker Hub. No inbound connections.
+
+## Quick start
+
+One-time steps on the host, in the directory you clone this repository into (the *stack
+directory*). Commands assume a user that may run `docker`; prefix `sudo` where your host
+requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
+
+1. **Clone.**
+   ```sh
+   git clone https://github.com/OWNER/arc-on-nas.git ci && cd ci
+   ```
+2. **Pre-flight checks.** Prints facts about the kernel, cgroups, Docker, storage, free resources
+   and the stack subnet; changes nothing (its overlayfs test creates and removes a throwaway
+   volume). Fix every `FAIL`.
+   ```sh
+   scripts/preflight.sh
+   ```
+3. **The trial.** Starts a throwaway node named `k3s-trial`, waits for it to be `Ready`, runs a pod,
+   reports the control plane's memory and the node's capacity, lists suspicious log lines and the
+   host kernel settings the kubelet changed, and removes everything. Run it as root to have
+   those settings restored. If it fails on storage, retry with `--snapshotter native`, and if that
+   works put `K3S_SNAPSHOTTER=native` in `.env`.
+   ```sh
+   sudo scripts/trial.sh
+   ```
+4. **Directories and settings.** The cache directory and its first claim directory, owned by the
+   runner (uid and gid 1001); the kubeconfig directory, root-owned with mode 700; `.env` from the
+   example, with `CACHE_DIR` and the sizing from [Sizing](#sizing).
+   ```sh
+   sudo install -d -o 1001 -g 1001 -m 750 /path/to/ci-cache/default
+   sudo install -d -o 0 -g 0 -m 700 kubeconfig
+   cp .env.example .env && chmod 600 .env && "${EDITOR:-vi}" .env
+   scripts/preflight.sh            # now also checks CACHE_DIR and kubeconfig/
+   ```
+5. **Bring the stack up** and wait for the node. The first start pulls k3s's system images
+   through the proxy.
+   ```sh
+   docker compose up -d --wait
+   docker compose exec k3s kubectl wait --for=condition=Ready node/ci-node --timeout=300s
+   docker compose exec k3s kubectl get node ci-node -o jsonpath='{.status.allocatable}{"\n"}'
+   ```
+   Check that the allocatable CPU and memory are what you sized for.
+6. **Namespaces, NetworkPolicies and the cache volume.**
+   ```sh
+   docker compose exec k3s kubectl apply -k /opt/arc-on-nas/manifests
+   docker compose exec k3s kubectl -n arc-runners get pvc ci-cache    # STATUS Bound
+   ```
+7. **The GitHub credential.** For a repository on a personal account: a
+   [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
+   with access to the CI repositories only, repository permission **Administration: Read and
+   write**, and an expiry date you put in your calendar. For an organisation, see
+   [Adding a repository](#adding-a-repository). Then store it; the script prompts and never takes
+   the token as an argument:
+   ```sh
+   scripts/register.sh
+   ```
+8. **The runner image.** Build it with [`images.yml`](.github/workflows/images.yml) in your copy of
+   this repository (push a tag `v*`, or `gh workflow run Images`), then put the printed
+   `image@sha256:...` into `helm/swift.yaml` (and `helm/ubuntu.yaml`), replacing `OWNER`. If the
+   package is private, see [Building the images](#building-the-images).
+9. **The controller.**
+   ```sh
+   docker compose run --rm helm upgrade --install arc \
+     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
+     --version 0.15.0 --namespace arc-systems -f helm/controller.yaml --wait
+   docker compose exec k3s kubectl -n arc-systems get pods            # arc-gha-rs-controller-... Running
+   ```
+10. **A runner scale set,** bound to one repository:
+    ```sh
+    docker compose run --rm helm upgrade --install swift \
+      oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+      --version 0.15.0 --namespace arc-runners -f helm/swift.yaml \
+      --set githubConfigUrl=https://github.com/OWNER/REPO --wait
+    docker compose exec k3s kubectl -n arc-systems get pods            # swift-...-listener Running
+    docker compose exec k3s kubectl -n arc-runners get pods            # one swift-...-runner-... Running
+    ```
+    The repository's Settings → Actions → Runners now lists the scale set `swift` with one idle
+    runner. Repeat with `ubuntu` and `helm/ubuntu.yaml` if you want the generic set.
+11. **Point a workflow at it:** `runs-on: swift`. [`examples/workflow.yml`](examples/workflow.yml)
+    is a complete workflow that routes to the scale set when a runner is online and to
+    GitHub-hosted runners otherwise. Before relying on its routing, check how GitHub lists the
+    scale set's runners (the example matches a name starting `swift-` or a label `swift`):
+    ```sh
+    gh api repos/OWNER/REPO/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'
+    ```
+    Run the workflow, then read which hosts the job contacted:
+    `docker compose exec proxy tail -n 50 /var/log/squid/access.log`.
+
+## Sizing
+
+The numbers that must agree, for a host whose kubelet reports `C` CPUs and `M` MiB (the node's
+capacity; `preflight.sh` prints both):
+
+```
+allocatable    A = what the runner pods and the system pods may request, all at once
+kube-reserved  K = the control plane: 500m CPU, 1536Mi (from k3s's measured 1.6 GB)
+system-reserved  = C - A - K   (CPU),   M - A - K - 100Mi   (memory)
+K3S_CPUS       >= A + K, plus headroom
+K3S_MEMORY     >  A + K + headroom      (never less: see below)
+maxRunners × pod size + system pods (~0.6 CPU, ~0.7 GiB) <= A
+```
+
+The memory rule is strict. The kubelet computes evictions from the host's memory, not the
+container's limit, so it never evicts to protect `K3S_MEMORY`. If the pods' limits plus the
+control plane exceed it, the kernel's OOM killer acts inside the container, and it may pick k3s
+itself (which restarts; running jobs fail).
+
+Example, the defaults in `.env.example`, for a host reporting 16 CPUs and 32 GiB with 4 cores and
+about 15 GiB kept for everything else:
+
+| | CPU | Memory |
+|---|---|---|
+| Capacity | 16 | 32768Mi |
+| `K3S_SYSTEM_RESERVED` | 6500m | 17664Mi |
+| `K3S_KUBE_RESERVED` | 500m | 1536Mi |
+| Allocatable | 9 | 13468Mi (13.1 GiB) |
+| `swift`: `maxRunners: 4` × 2 CPU, 3 GiB | 8 | 12 GiB |
+| System pods (CoreDNS, metrics-server, controller, two listeners) | ~0.6 | ~0.7 GiB |
+| `K3S_CPUS` / `K3S_MEMORY` (hard caps) | 10 | 17 GiB |
+| Left to the host at full CI load / when CI is idle | 6 / 16 | 15 GiB / all |
+
+The `ubuntu` set (1 CPU, 2 GiB per pod) shares the same allocatable: when the Swift pods fill it,
+its pods wait, and the other way round. Pod sizes are a trade: 2 CPUs and 3 GiB suits a
+medium Swift package; fewer, larger pods finish each job sooner, more, smaller pods run more jobs
+at once. Keep requests equal to limits either way, and tell the tools in the job the pod's CPU
+count (`RUNNER_CPUS`, or the cgroup quota as `examples/workflow.yml` reads it): inside a pod, the
+software still sees every host core.
+
+## Adding a toolchain
+
+A toolchain is an image plus a scale set.
+
+1. Add `images/<name>/Dockerfile` `FROM` the same pinned `ghcr.io/actions/actions-runner` image,
+   install the toolchain (by checksum), remove `sudo` as the existing images do, and end with
+   `USER 1001`. The runner must stay at `/home/runner` with `/home/runner/run.sh`, and the
+   container must be named `runner` in the values (ARC's requirements).
+2. Add the image to the matrix in `.github/workflows/images.yml`, and its tag check to
+   `scripts/check-consistency.sh` if it has its own version.
+3. Copy `helm/ubuntu.yaml` to `helm/<name>.yaml`; set the image, the pod size (requests equal to
+   limits), `RUNNER_CPUS`, `minRunners` and `maxRunners`, and redo the [Sizing](#sizing) sum.
+4. Install it as in [Quick start](#quick-start) step 10 with the release name `<name>`; workflows
+   use `runs-on: <name>`.
+
+## Adding a repository
+
+A scale set is bound to one `githubConfigUrl`. What that URL can be depends on who owns the
+repositories.
+
+**Facts from GitHub's documentation:**
+
+- "Runner scale sets can be deployed at the repository, organization, or enterprise levels"
+  ([deploy runner scale sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
+  There is no user-account level: on a personal account, every repository needs its own scale
+  set.
+- Credentials
+  ([authenticate to the API](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)):
+
+  | Method | Repository level | Organization level |
+  |---|---|---|
+  | GitHub App | Administration: read and write; Metadata: read-only | Self-hosted runners: read and write; Metadata: read-only |
+  | Personal access token (classic) | `repo` | `admin:org` |
+  | Fine-grained personal access token | Administration: read and write | Self-hosted runners: read and write |
+
+  The documented GitHub App path starts with "Create a GitHub App that is owned by an
+  organization". Enterprise-level scale sets need a classic token.
+- Runner groups decide which repositories of an organisation may use a scale set: "All
+  organizations have a single default runner group", additional groups need a paid plan, and "by
+  default, only private repositories can access runners in a runner group"
+  ([manage access](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)).
+  Repository-level scale sets have no group: leave `runnerGroup` unset.
+
+**On a personal account**, for each additional repository:
+
+1. Extend the fine-grained token to that repository (or create a second one and store it under
+   another Secret name with `scripts/register.sh --name ...`, then set `githubConfigSecret`).
+2. Give it its own cache: copy both objects in `manifests/cache.yaml` with a new name and
+   subdirectory, create the directory owned by 1001:1001, apply.
+3. Install the chart again with a release name of its own, its URL and the new claim, for
+   example `swift-otherrepo` with `--set githubConfigUrl=https://github.com/OWNER/OTHERREPO` and
+   `--set template.spec.volumes[1].persistentVolumeClaim.claimName=ci-cache-otherrepo`. Each
+   release costs one small listener pod, and nothing else while idle at `minRunners: 0`.
+
+**In an organisation**, one scale set per toolchain serves every repository:
+`--set githubConfigUrl=https://github.com/ORG`, authenticated by a GitHub App owned by the
+organisation and installed on it (`scripts/register.sh --app-id ... --installation-id ...
+--private-key-file ...`), with runner groups choosing the repositories. Workflows in any allowed
+repository use `runs-on: <name>` without touching the cluster. Repositories then share the scale
+set and therefore its cache claim; give untrusted-to-each-other repositories separate scale sets.
+
+## Building the images
+
+[`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift` and
+`images/ubuntu` on GitHub-hosted runners when you push a tag `v*` (or `gh workflow run Images`),
+pushes them to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, and
+prints `image:tag@sha256:digest` in the job summary. Pin that full reference in the values file:
+tags are overwritten by later builds, digests are not.
+
+Packages pushed from a private repository are private. Either make the package public in its
+settings on GitHub, or create a pull secret with a token that has `read:packages` and uncomment
+`imagePullSecrets` in the values:
+
+```sh
+read -rsp 'Token with read:packages: ' t; echo
+auth=$(printf '%s:%s' OWNER "$t" | base64 -w0)
+printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$auth" \
+  | docker compose exec -T k3s kubectl -n arc-runners create secret generic ghcr-pull \
+      --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=/dev/stdin \
+      --dry-run=client -o yaml \
+  | docker compose exec -T k3s kubectl apply -f -
+unset t auth
+```
+
+The token goes through standard input only, as with `scripts/register.sh`. (Not exercised by
+this repository's CI.)
+
+Without a registry: build on the host (`docker build -t arc-runner-swift:local images/swift`),
+import the image into the node's containerd
+(`docker save arc-runner-swift:local | docker compose exec -T k3s ctr -n k8s.io images import -`),
+and use `image: docker.io/library/arc-runner-swift:local` with `imagePullPolicy: Never`. Also not
+exercised by CI.
+
+## Operations
+
+**Updates are by digest, deliberately.** Nothing here updates itself: images are pinned by digest,
+the compose services opt out of Watchtower, the charts are pinned by version, and a runner's
+self-update cannot outlive its pod. To update an image, find the new tag's digest
+(`docker buildx imagetools inspect <image>:<tag>`), change tag and digest together, and run
+`scripts/check-consistency.sh`.
+
+| Component | Where | Source | When |
+|---|---|---|---|
+| k3s | `docker-compose.yml`, `scripts/trial.sh` | [k3s releases](https://github.com/k3s-io/k3s/releases) | monthly patch releases; one minor version at a time |
+| ARC charts | `--version` in `helm/` and the commands | [ARC releases](https://github.com/actions/actions-runner-controller/releases) | on release; see the CRD procedure below |
+| Runner base image | `images/*/Dockerfile` | [actions/runner releases](https://github.com/actions/runner/releases) | **within 30 days** of each release |
+| Swift | `images/swift/Dockerfile` | [swift.org](https://www.swift.org/install/linux/) | with your projects |
+| Squid, Helm client | `docker-compose.yml` | Docker Hub | as needed |
+
+Apply a compose change with `docker compose up -d`; recreating the node restarts every pod, and a
+job running at that moment fails. Drain first if that matters: set both limits to 0 on each scale set and wait
+for its runner pods to finish:
+
+```sh
+docker compose run --rm helm upgrade swift \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set --version 0.15.0 \
+  --namespace arc-runners --reuse-values --set minRunners=0 --set maxRunners=0
+```
+
+Upgrade it again with `-f helm/swift.yaml --set githubConfigUrl=...` to restore it.
+
+**The 30-day rule.** GitHub: "If you do not perform a software update within 30 days, the GitHub
+Actions service will not queue jobs to your runner"
+([self-hosted runners reference](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)).
+Ephemeral pods cannot keep a self-update, so the runner version is the image's: rebuild the images
+on the new `actions/runner` release and update the digests in `helm/` within 30 days. Whether
+GitHub sends update requests to scale-set runners at all is not documented; the rule above holds
+either way.
+
+**Cache pruning.** The cache only grows. [`scripts/prune-cache.sh`](scripts/prune-cache.sh) lists
+(or with `--apply` deletes) entries two levels down, such as `swiftpm-build/<package>`, in which
+nothing changed for 30 days. Schedule it weekly with the host's task scheduler, as root:
+`scripts/prune-cache.sh --days 30 --apply /path/to/ci-cache/default`. Emptying the cache entirely
+is safe at any time no job runs; the next builds are cold. [`scripts/warm.sh`](scripts/warm.sh)
+starts a consumer's workflow by hand to warm it again (the example workflow also runs weekly).
+
+**Backups.** Back up `.env` and your edits to `helm/`. Nothing else needs it: the cluster can be
+recreated from this repository (`docker compose down -v`, then the Quick start from step 5), the
+credential re-created from GitHub, and the cache rebuilt by the next runs. Exclude `CACHE_DIR` and
+Docker's volumes from snapshots. The kubeconfig is regenerated by k3s; a copy of it is a
+cluster-admin credential.
+
+**When a chart release changes the CRDs.** Helm does not upgrade or delete CRDs, and ARC's
+documented procedure for a controller upgrade is to remove everything and install again
+([deploy runner scale sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
+Read the release notes; if the CRDs changed (or when in doubt):
+
+```sh
+docker compose run --rm helm uninstall swift --namespace arc-runners --wait     # every scale set
+docker compose run --rm helm uninstall ubuntu --namespace arc-runners --wait
+docker compose exec k3s kubectl get autoscalingrunnersets,ephemeralrunners -A   # wait until empty
+docker compose run --rm helm uninstall arc --namespace arc-systems --wait
+docker compose exec k3s kubectl delete crd autoscalinglisteners.actions.github.com \
+  autoscalingrunnersets.actions.github.com ephemeralrunners.actions.github.com \
+  ephemeralrunnersets.actions.github.com
+# change the version in helm/*.yaml, scripts/lint.sh and the CI workflow, then install as in steps 9 and 10
+```
+
+The credential Secret, the namespaces and the cache survive this. Jobs queued meanwhile wait, or
+run on GitHub-hosted runners if your workflow routes as the example does.
+
+**Removing everything.** Uninstall the scale sets first (as above), so GitHub forgets them, then
+`docker compose down -v`, and delete `CACHE_DIR` and `kubeconfig/` if you want them gone.
+
+## Troubleshooting
+
+Start with `docker compose exec k3s kubectl get pods -A`, `docker compose logs k3s`, and the
+proxy's log (`docker compose exec proxy tail -n 100 /var/log/squid/access.log`).
+
+| Symptom | Likely cause and fix |
+|---|---|
+| `docker compose up`: "Pool overlaps with other one on this address space" | Another network uses `172.31.250.0/24`. Change the subnet in the files listed at the top of `docker-compose.yml`; `scripts/check-consistency.sh` confirms. |
+| The node stays `NotReady`; k3s logs "failed to get rootfs info" or overlayfs/snapshotter errors | The storage under Docker's volumes (often ZFS or btrfs). Try `K3S_SNAPSHOTTER=native` in `.env` and `docker compose up -d`; test first with `scripts/trial.sh --snapshotter native`. |
+| System pods stuck in `ContainerCreating` / `ErrImagePull` | Image pulls fail through the proxy. Check the proxy log for `TCP_DENIED`, the host's DNS, and that the proxy is running. |
+| k3s logs "too many open files" or inotify errors | Raise `fs.inotify.max_user_watches` and `max_user_instances` on the host ([Requirements](#requirements)). |
+| Runner pods `Pending` with "Insufficient cpu" or "memory" | Working as designed when the set is at capacity; otherwise `maxRunners` × pod size exceeds allocatable. Redo [Sizing](#sizing). |
+| A runner pod is refused: "violates PodSecurity restricted" | The values file loosened the pod template (root, capabilities, privilege escalation, hostPath). Undo that change. |
+| The listener restarts; logs mention 401, 403 or 404 | The credential lacks the permission in [Adding a repository](#adding-a-repository), has expired, or `githubConfigUrl` is wrong. `scripts/register.sh`, then delete the listener pod. |
+| The listener cannot connect | The proxy URL in the values, or the proxy refusing GitHub (the log shows why). |
+| Runner pods `ImagePullBackOff` | A private package without a pull secret, or a wrong digest ([Building the images](#building-the-images)). |
+| A job cannot download something | Its host is on a private address, or it uses a port other than 80/443, or the tool ignores `https_proxy`. The proxy log shows the attempt. |
+| Jobs fail with exit code 137, or k3s restarts | The OOM killer. A pod's limit is too small for the job, or the sum in [Sizing](#sizing) exceeds `K3S_MEMORY`. |
+| Builds are slow or thrash | The tools inside the pod use every host core; pass the pod's CPU count (`RUNNER_CPUS`). |
+| Jobs stop being picked up after a month | The runner image is older than 30 days behind the latest `actions/runner` release. |
+
+## Limitations
+
+- **The k3s container is privileged** (see [Security posture](#security-posture)).
+- **No awareness of host load.** The scheduler compares requests with allocatable; it does not
+  see the host's real CPU use. Fixed budgets, `cpu_shares` under contention and `maxRunners` are
+  the controls. ARC has no schedule for `minRunners`/`maxRunners`; a cron job running
+  `helm upgrade --reuse-values --set maxRunners=...` can implement quiet hours.
+- **One node.** No high availability; a host reboot interrupts running jobs.
+- **No Docker in jobs.** No `container:` jobs, service containers or `docker build`: ARC's `dind`
+  mode adds a privileged sidecar that, on a privileged node, is root on the host. Not supported
+  here.
+- **Personal accounts:** one scale set per repository, a personal access token with an expiry,
+  no runner groups.
+- **ARC is version 0.x;** chart upgrades may require the uninstall and reinstall procedure, and
+  GitHub supports only the latest release
+  ([support for ARC](https://docs.github.com/en/actions/concepts/runners/support-for-arc), which
+  also excludes Kubernetes setup, template customisation and storage from GitHub's support).
+- **The kubelet sets host kernel settings** unless you use `--protect-kernel-defaults`.
+- **The node container can reach the host's ports** through the stack network's gateway; only a
+  host firewall rule closes that.
+- **x86_64 only** for the Swift image as written.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
+| `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim. |
+| `helm/` | Values for the controller and the `swift` and `ubuntu` scale sets. |
+| `images/` | The runner images. |
+| `scripts/` | `preflight.sh`, `trial.sh`, `register.sh`, `warm.sh`, `prune-cache.sh`; `lint.sh` and `check-consistency.sh` for development. |
+| `examples/workflow.yml` | A consumer repository's workflow. |
+| `.github/workflows/` | This repository's CI (lint and the smoke test) and the image builds. |
+
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+Licence: [MIT](LICENSE).

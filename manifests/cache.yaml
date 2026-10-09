@@ -1,0 +1,50 @@
+# The warm build cache: one directory on the host, shared by every runner pod of one repository.
+#
+# A static PersistentVolume, not a hostPath volume in the pod template: Pod Security's baseline
+# and restricted levels forbid hostPath in pods, but allow a pod to mount any claim. ReadWriteOnce
+# means one node, not one pod, so every pod on this single node can mount it at once.
+#
+# The path is the k3s container's: docker-compose.yml bind-mounts CACHE_DIR at /var/lib/ci-cache.
+# The directory must exist and belong to uid and gid 1001 (the runner) before a pod mounts it:
+#   sudo install -d -o 1001 -g 1001 -m 750 "$CACHE_DIR/default"
+#
+# One claim per repository, never shared between repositories: every job can write what later
+# jobs read. For a second repository, copy both objects with a new name and a new subdirectory.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ci-cache
+  labels:
+    app.kubernetes.io/part-of: arc-on-nas
+spec:
+  capacity:
+    # Informational: hostPath volumes are not size-limited. Watch the disk (README, "Operations").
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  # Empty: no StorageClass, no dynamic provisioning, bound only to the claim below.
+  storageClassName: ""
+  claimRef:
+    namespace: arc-runners
+    name: ci-cache
+  hostPath:
+    path: /var/lib/ci-cache/default
+    # Fail rather than create it root-owned, which the runner could not write.
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ci-cache
+  namespace: arc-runners
+  labels:
+    app.kubernetes.io/part-of: arc-on-nas
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: ci-cache
+  resources:
+    requests:
+      storage: 50Gi

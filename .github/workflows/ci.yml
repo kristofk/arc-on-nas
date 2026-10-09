@@ -1,0 +1,270 @@
+name: CI
+
+# lint   every static check (scripts/lint.sh, with the tool versions in mise.toml).
+# host   scripts/preflight.sh and scripts/trial.sh on a GitHub-hosted runner.
+# smoke  the real stack on a GitHub-hosted runner: docker compose up, the node Ready, the
+#        manifests applied, the credential Secret created by scripts/register.sh, the controller
+#        chart installed through the proxy and running, the runner pod templates admitted by Pod
+#        Security "restricted", and the egress rules tested from a pod.
+#
+# What a hosted runner cannot show (README, "Status"): a scale set registering with GitHub and
+# running a job (that needs a real credential and a repository to register with), the runner
+# images (built by images.yml), the cache under a real build, and anything about your host's
+# storage, kernel or sizing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: scripts/lint.sh
+        run: mise exec -- scripts/lint.sh
+
+  host:
+    name: Preflight and trial
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: scripts/preflight.sh
+        run: scripts/preflight.sh
+      - name: scripts/trial.sh
+        run: scripts/trial.sh --timeout 240
+
+  smoke:
+    name: Smoke test
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CHART_VERSION: "0.15.0"
+      CHARTS: oci://ghcr.io/actions/actions-runner-controller-charts
+      PROXY: http://172.31.250.2:3128
+      GATEWAY: 172.31.250.1
+      CURL_IMAGE: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Directories and .env for a 4-CPU, 16 GB hosted runner
+        run: |
+          set -euo pipefail
+          sudo install -d -o 1001 -g 1001 -m 750 "$RUNNER_TEMP/ci-cache/default"
+          sudo install -d -o 0 -g 0 -m 700 kubeconfig
+          # Small caps and reservations: allocatable is about 2.5 CPUs and 4 GiB here.
+          cat > .env <<EOF
+          CACHE_DIR=$RUNNER_TEMP/ci-cache
+          K3S_CPUS=3
+          K3S_MEMORY=6g
+          K3S_CPU_SHARES=256
+          K3S_PIDS_LIMIT=32768
+          K3S_SYSTEM_RESERVED=cpu=1,memory=11Gi
+          K3S_KUBE_RESERVED=cpu=500m,memory=512Mi
+          K3S_SNAPSHOTTER=overlayfs
+          K3S_EXTRA_ARGS=
+          EOF
+          sed -i 's/^ *//' .env
+          cat .env
+
+      - name: scripts/preflight.sh with the stack's settings
+        run: scripts/preflight.sh
+
+      - name: docker compose up
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: The node is Ready
+        run: |
+          set -euo pipefail
+          # The node object appears a few seconds after the API server answers.
+          for _ in $(seq 1 30); do
+            docker compose exec -T k3s kubectl get node ci-node >/dev/null 2>&1 && break
+            sleep 2
+          done
+          # Ready needs the system pods' images, which containerd pulls through the proxy.
+          docker compose exec -T k3s kubectl wait --for=condition=Ready node/ci-node --timeout=180s
+          docker compose exec -T k3s kubectl get node ci-node -o wide
+          fmt='capacity {.status.capacity.cpu} CPU {.status.capacity.memory}; '
+          fmt+='allocatable {.status.allocatable.cpu} CPU {.status.allocatable.memory}{"\n"}'
+          docker compose exec -T k3s kubectl get node ci-node -o jsonpath="$fmt"
+
+      - name: Apply the manifests
+        run: |
+          set -euo pipefail
+          docker compose exec -T k3s kubectl apply -k /opt/arc-on-nas/manifests
+          for _ in $(seq 1 30); do
+            phase=$(docker compose exec -T k3s kubectl -n arc-runners get pvc ci-cache -o jsonpath='{.status.phase}')
+            [ "$phase" = Bound ] && break
+            sleep 2
+          done
+          echo "ci-cache: $phase"
+          test "$phase" = Bound
+
+      - name: scripts/register.sh stores a credential
+        run: |
+          set -euo pipefail
+          # A dummy value: nothing registers with GitHub in this test.
+          printf 'not-a-real-token\n' > "$RUNNER_TEMP/token"
+          scripts/register.sh --token-file "$RUNNER_TEMP/token"
+          stored=$(docker compose exec -T k3s kubectl -n arc-runners get secret github-credentials \
+            -o jsonpath='{.data.github_token}' | base64 -d)
+          test "$stored" = not-a-real-token
+          printf 'not-a-real-key\n' > "$RUNNER_TEMP/key.pem"
+          scripts/register.sh --name app-test --app-id 1 --installation-id 2 --private-key-file "$RUNNER_TEMP/key.pem"
+          keys=$(docker compose exec -T k3s kubectl -n arc-runners get secret app-test \
+            -o go-template='{{range $k, $v := .data}}{{$k}} {{end}}')
+          test "$keys" = "github_app_id github_app_installation_id github_app_private_key "
+          docker compose exec -T k3s kubectl -n arc-runners delete secret app-test
+          rm -f "$RUNNER_TEMP/token" "$RUNNER_TEMP/key.pem"
+          echo "Both credential forms stored."
+
+      - name: Install the controller chart with the helm service
+        run: |
+          set -euo pipefail
+          docker compose run --rm -T helm upgrade --install arc \
+            "$CHARTS/gha-runner-scale-set-controller" --version "$CHART_VERSION" \
+            --namespace arc-systems -f helm/controller.yaml --wait --timeout 5m
+          docker compose exec -T k3s kubectl -n arc-systems wait --for=condition=Ready pod \
+            -l app.kubernetes.io/part-of=gha-rs-controller --timeout=120s
+          docker compose exec -T k3s kubectl -n arc-systems get pods -o wide
+          docker compose exec -T k3s kubectl get crd autoscalingrunnersets.actions.github.com
+
+      - name: The controller pod meets Pod Security "restricted"
+        run: |
+          set -euo pipefail
+          # A server-side dry run of enforcing "restricted" on arc-systems lists every existing pod
+          # that would violate it, as warnings.
+          out=$(docker compose exec -T k3s kubectl label --dry-run=server --overwrite namespace arc-systems \
+            pod-security.kubernetes.io/enforce=restricted 2>&1)
+          echo "$out"
+          if echo "$out" | grep -qi warning; then exit 1; fi
+
+      - name: The runner pod templates are admitted by Pod Security "restricted"
+        run: |
+          set -euo pipefail
+          # The pods ARC would create from each scale set's template. Their service account comes
+          # with the scale set's chart, which is not installed here: the default one stands in.
+          for s in swift ubuntu; do
+            docker compose run --rm -T helm template "$s" "$CHARTS/gha-runner-scale-set" \
+              --version "$CHART_VERSION" --namespace arc-runners -f "helm/$s.yaml" \
+              --set githubConfigUrl=https://github.com/OWNER/REPO > "$RUNNER_TEMP/$s.yaml"
+            yq 'select(.kind == "AutoscalingRunnerSet") | {"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "'"$s"'-runner", "namespace": "arc-runners"}, "spec": .spec.template.spec}
+                | del(.spec.serviceAccountName)' "$RUNNER_TEMP/$s.yaml" > "$RUNNER_TEMP/$s-pod.yaml"
+            docker compose exec -T k3s kubectl apply --dry-run=server -f - < "$RUNNER_TEMP/$s-pod.yaml"
+          done
+          # And a privileged pod is refused.
+          overrides='{"spec":{"containers":[{"name":"privileged","image":"'"$CURL_IMAGE"'",'
+          overrides+='"securityContext":{"privileged":true}}]}}'
+          if docker compose exec -T k3s kubectl -n arc-runners run privileged --dry-run=server \
+               --image="$CURL_IMAGE" --overrides="$overrides" 2> "$RUNNER_TEMP/refused.txt"; then
+            echo "A privileged pod was admitted to arc-runners." >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/refused.txt"
+          grep -q 'violates PodSecurity "restricted' "$RUNNER_TEMP/refused.txt"
+
+      - name: Egress from a runner-like pod
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          # A listener on the host, to show what the NetworkPolicy blocks.
+          python3 -m http.server 18080 --bind 0.0.0.0 > /dev/null 2>&1 &
+          # Restricted, uid 1001, the cache claim mounted: what a runner pod gets.
+          k apply -f - <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: egress-test
+            namespace: arc-runners
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsUser: 1001
+              runAsGroup: 1001
+              runAsNonRoot: true
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: test
+                image: $CURL_IMAGE
+                command: ["sleep", "600"]
+                resources:
+                  requests: {cpu: 100m, memory: 64Mi}
+                  limits: {cpu: 100m, memory: 64Mi}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: {drop: [ALL]}
+                volumeMounts:
+                  - {name: cache, mountPath: /home/runner/cache}
+            volumes:
+              - name: cache
+                persistentVolumeClaim: {claimName: ci-cache}
+          EOF
+          k -n arc-runners wait --for=condition=Ready pod/egress-test --timeout=180s
+          run() { k -n arc-runners exec egress-test -- "$@"; }
+          code() { run curl -sS -o /dev/null -m 15 -w '%{http_code}' "$@" || true; }
+
+          run sh -c 'f=/home/runner/cache/smoke-test; echo ok > $f && cat $f && rm $f'
+          echo "cache: writable as uid 1001"
+
+          c=$(code -x "$PROXY" https://github.com/); echo "github.com through the proxy: $c"
+          [ "$c" = 200 ]
+          c=$(code -x "$PROXY" http://169.254.169.254/); echo "link-local through the proxy: $c"
+          [ "$c" = 403 ]
+          c=$(code -x "$PROXY" https://10.43.0.1/); echo "a private address through the proxy: $c"
+          [ "$c" != 200 ]
+          c=$(code -k https://kubernetes.default.svc/version); echo "cluster DNS and the API service: $c"
+          [ "$c" != 000 ]
+          c=$(code --noproxy '*' https://1.1.1.1/); echo "the internet without the proxy: $c"
+          [ "$c" = 000 ]
+
+          # The host's port through the stack network's gateway: open to a plain container on the
+          # network (Docker's documented limit), closed to the pod (the NetworkPolicy).
+          c=$(docker run --rm --network ci_runners "$CURL_IMAGE" \
+                -sS -o /dev/null -m 10 -w '%{http_code}' "http://$GATEWAY:18080/" || true)
+          echo "host port via the gateway, from a container on the network: $c"
+          [ "$c" = 200 ]
+          c=$(code --noproxy '*' "http://$GATEWAY:18080/"); echo "host port via the gateway, from the pod: $c"
+          [ "$c" = 000 ]
+          k -n arc-runners delete pod egress-test --wait=false
+
+      - name: The proxy saw the pulls
+        run: docker compose exec -T proxy grep -cE 'CONNECT (registry-1.docker.io|ghcr.io)' /var/log/squid/access.log
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker compose logs --tail 200 k3s || true
+          docker compose exec -T k3s kubectl get pods -A -o wide || true
+          docker compose exec -T k3s kubectl get events -A --sort-by=.lastTimestamp | tail -n 60 || true
+          docker compose exec -T k3s kubectl -n arc-systems describe pods || true
+          docker compose exec -T proxy tail -n 60 /var/log/squid/access.log || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose down -v --timeout 30 || true
+          sudo rm -rf kubeconfig "$RUNNER_TEMP/ci-cache" .env

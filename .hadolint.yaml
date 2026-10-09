@@ -1,0 +1,4 @@
+# Dockerfile lint settings (https://github.com/hadolint/hadolint).
+failure-threshold: warning
+trustedRegistries:
+  - ghcr.io
