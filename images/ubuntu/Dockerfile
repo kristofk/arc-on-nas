@@ -19,7 +19,7 @@ RUN apt-get update \
 
 # No sudo for the runner user (see images/swift/Dockerfile).
 RUN gpasswd -d runner sudo \
- && apt-get purge -y sudo \
+ && SUDO_FORCE_REMOVE=yes apt-get purge -y sudo \
  && rm -rf /var/lib/apt/lists/*
 
 USER 1001

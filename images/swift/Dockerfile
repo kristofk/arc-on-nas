@@ -36,9 +36,10 @@ RUN curl -fsSL -o /tmp/swift.tar.gz \
 
 # The base image gives the runner user passwordless sudo. A job must not become root: remove the
 # user from the sudo group and remove sudo itself. (The pod template's allowPrivilegeEscalation:
-# false would also stop a setuid binary; this removes the binary.)
+# false would also stop a setuid binary; this removes the binary. Debian refuses to purge sudo
+# without SUDO_FORCE_REMOVE=yes, which is safe here: the image never needs root again.)
 RUN gpasswd -d runner sudo \
- && apt-get purge -y sudo \
+ && SUDO_FORCE_REMOVE=yes apt-get purge -y sudo \
  && rm -rf /var/lib/apt/lists/*
 
 # Numeric, so Kubernetes can check runAsNonRoot. uid 1001 is the base image's runner user.
