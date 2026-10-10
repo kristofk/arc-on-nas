@@ -28,9 +28,16 @@ Contents: [Status](#status) · [How it works](#how-it-works) · [Security postur
 Version 0.1.0, the first release. Pinned: k3s `v1.36.5+k3s1`, ARC charts `0.15.0`, runner
 `2.338.0`, Swift `6.4.0`, Squid 6 (`ubuntu/squid:6.6-24.04_edge`), Helm `3.22.0`. Every image this
 repository starts itself (compose services, CI, the scripts' test images, the runner images'
-base) is pinned by digest; the runner images in `helm/` are tag placeholders until you pin your
-build's digest, the controller and listener images follow the chart version, and k3s's bundled
+base) is pinned by digest; the runner images in `helm/` are pinned to the digests of the images
+this repository's CI built (below); new packages on `ghcr.io` start private and their visibility is
+the owner's to set, so pin your own build's reference and digest instead. The controller and listener images follow the chart version, and k3s's bundled
 images follow the k3s release.
+
+**Built once by CI.** [`images.yml`](.github/workflows/images.yml) built both runner images on
+2026-10-10 (run 38055256920, dispatched on `main`), and the digests in `helm/` are that run's. The
+first attempt (run 38055141576) failed at removing `sudo`, which Debian's package tools refuse
+without `SUDO_FORCE_REMOVE=yes`; the Dockerfiles now set it. The images have been built and pushed,
+not yet pulled or run by a cluster.
 
 **Verified by this repository's CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a
 GitHub-hosted Ubuntu 24.04 runner (2 CPUs and 8 GB for a private repository, Docker 28 with
@@ -70,8 +77,9 @@ cgroup v2 on ext4):
   repository; the smoke test installs only the controller. The listener's restricted
   security context (from `listenerTemplate`) is schema-checked but has never run, which is why
   `arc-systems` enforces `baseline`, not `restricted`.
-- **The runner images.** [`images.yml`](.github/workflows/images.yml) builds them on a tag; it
-  has not been run. The Swift checksum is the published one for the 6.4.0 Ubuntu 24.04 tarball.
+- **The runner images, run.** [`images.yml`](.github/workflows/images.yml) built them once (see
+  Status above); no pod has pulled or run them, and no job has used the Swift toolchain in one.
+  The Swift checksum is the published one for the 6.4.0 Ubuntu 24.04 tarball.
 - **The warm cache under real builds,** including SwiftPM's lock behaviour across pods and
   `prune-cache.sh` on a real cache.
 - **The sizing numbers** in `.env.example` and [Sizing](#sizing): arithmetic from published
@@ -322,7 +330,8 @@ requires it (for the scripts, `DOCKER="sudo docker" scripts/...`).
    [`images.yml`](.github/workflows/images.yml) in it (push a tag `v*`, or
    `gh workflow run Images --repo OWNER/arc-on-nas`); it pushes to your account's packages on
    `ghcr.io` with the `packages: write` permission it declares. Put the printed
-   `image@sha256:...` into `helm/swift.yaml` (and `helm/ubuntu.yaml`), replacing `OWNER`. If the
+   `image@sha256:...` into `helm/swift.yaml` (and `helm/ubuntu.yaml`), replacing the `image:` line
+(the files hold the repository owner's build). If the
    package is private, see [Building the images](#building-the-images).
 9. **The controller.**
    ```sh

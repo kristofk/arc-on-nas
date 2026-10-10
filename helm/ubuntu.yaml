@@ -69,8 +69,9 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        # Built from images/ubuntu/Dockerfile. Replace OWNER and pin the digest.
-        image: ghcr.io/OWNER/arc-runner-ubuntu:2.338.0
+        # Built from images/ubuntu/Dockerfile. Pinned to the repository owner's build; replace it with yours.
+        # yamllint disable-line rule:line-length
+        image: ghcr.io/kristofk/arc-runner-ubuntu:2.338.0@sha256:7abaf816286ac48485493ef1f401378d4f7144dd5369ba1ee256f8c367733dc8
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         env:

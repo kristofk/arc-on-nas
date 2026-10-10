@@ -87,9 +87,10 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        # Built from images/swift/Dockerfile by .github/workflows/images.yml. Replace OWNER, and pin
-        # the digest the workflow prints: ghcr.io/OWNER/arc-runner-swift:<tag>@sha256:<digest>
-        image: ghcr.io/OWNER/arc-runner-swift:6.4.0-2.338.0
+        # Built from images/swift/Dockerfile by .github/workflows/images.yml. Pinned to
+        # the digest of the repository owner's build; replace it with yours.
+        # yamllint disable-line rule:line-length
+        image: ghcr.io/kristofk/arc-runner-swift:6.4.0-2.338.0@sha256:fc4829770130bba7ac913c5a53f14d77add6bc36ce8649971641a481294a5187
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         env:
