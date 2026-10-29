@@ -16,10 +16,11 @@ for tool in NODE SWIFT CADDY BUILDCTL KUBECTL; do
 done
 docker run --rm -i --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges \
   "${args[@]}" "$ref" /bin/bash -euo pipefail -s <<'CHECK'
+trap 'echo "Runtime check failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 test "$(id -u)" = 1001
 test "$(id -g)" = 1001
 test "$(id -un)" = runner
-! command -v sudo
+if command -v sudo; then echo "sudo must not be installed" >&2; exit 1; fi
 # shellcheck disable=SC1091
 . /etc/os-release
 if [ "$IMAGE_SET" = swift ]; then test "$VERSION_ID" = 26.04; else test "$VERSION_ID" = 24.04; fi
@@ -32,7 +33,8 @@ test -d /home/runner/k8s-novolume
 # This starts the self-contained .NET runtime on the final distribution, without credentials.
 runner=$(/home/runner/bin/Runner.Listener --version)
 printf 'Runner.Listener: %s\n' "$runner"
-test "$runner" = "$EXPECTED_RUNNER"
+# The image intentionally streams runner diagnostics to stdout alongside its version line.
+grep -qxF "$EXPECTED_RUNNER" <<< "$runner"
 /home/runner/config.sh --help
 /home/runner/externals/node24/bin/node --version
 docker --version
