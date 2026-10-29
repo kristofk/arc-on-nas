@@ -22,5 +22,16 @@ RUN gpasswd -d runner sudo \
  && SUDO_FORCE_REMOVE=yes apt-get purge -y sudo \
  && rm -rf /var/lib/apt/lists/*
 
+# The same Node as the Swift image and AIDepartment's ci/tools.pin, independent of the runner's
+# internal Node. Keep this first on PATH for jobs in the ci-light set.
+ARG NODE_VERSION=24.22.0
+ARG NODE_SHA256=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
+RUN curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+ && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/node \
+ && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.xz
+ENV PATH="/opt/node/bin:${PATH}"
+
 USER 1001
 WORKDIR /home/runner

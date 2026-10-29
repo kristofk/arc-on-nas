@@ -2,15 +2,18 @@ name: Images
 
 # Builds the runner images in images/ and pushes them to the GitHub Container Registry of the
 # repository's owner: ghcr.io/<owner>/arc-runner-swift and ghcr.io/<owner>/arc-runner-ubuntu.
-# Runs when a tag v* is pushed, or by hand: `gh workflow run Images --ref <branch or tag>`.
+# Pull requests build and test without publishing. A tag v* or a manual dispatch publishes
+# only after the same runtime checks pass: `gh workflow run Images --ref <branch or tag>`.
 #
-# Each image is tagged with the versions it contains (Swift and runner, or runner only) and with
+# Each image is tagged with its runner and Node versions (plus Swift and Ubuntu for swift) and with
 # the commit. Tags move; the digest does not. The job summary prints image@digest: put that in
 # helm/swift.yaml or helm/ubuntu.yaml.
 #
 # A package pushed from a private repository is private: make it public in the package's
 # settings, or give the cluster a pull secret (README, "Building the images").
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -25,6 +28,7 @@ concurrency:
 jobs:
   build:
     name: ${{ matrix.image }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -48,12 +52,14 @@ jobs:
           file="images/$IMAGE/Dockerfile"
           runner=$(sed -n 's|^FROM ghcr.io/actions/actions-runner:\([0-9.]*\)@.*|\1|p' "$file")
           test -n "$runner"
+          node=$(sed -n 's/^ARG NODE_VERSION=//p' "$file")
+          test -n "$node"
           if [ "$IMAGE" = swift ]; then
             swift=$(sed -n 's|^ARG SWIFT_VERSION=\(.*\)$|\1|p' "$file")
             test -n "$swift"
-            tag="$swift-$runner"
+            tag="$swift-$runner-ubuntu26.04-node$node"
           else
-            tag="$runner"
+            tag="$runner-node$node"
           fi
           owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/$owner/arc-runner-$IMAGE" >> "$GITHUB_OUTPUT"
@@ -69,31 +75,71 @@ jobs:
           labels: |
             org.opencontainers.image.title=arc-runner-${{ matrix.image }}
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Swift before (published Ubuntu 24.04 image)
+        if: matrix.image == 'swift'
+        env:
+          # yamllint disable-line rule:line-length
+          BEFORE: ghcr.io/kristofk/arc-runner-swift:6.4.0-2.338.0@sha256:fc4829770130bba7ac913c5a53f14d77add6bc36ce8649971641a481294a5187
+        run: |
+          docker run --rm --user 1001 --cap-drop ALL --security-opt no-new-privileges \
+            "$BEFORE" \
+            swift --version | tee swift-before.txt
+          docker image rm "$BEFORE"
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build
         with:
           context: images/${{ matrix.image }}
-          # The Swift tarball in images/swift is for x86_64; add linux/arm64 to the ubuntu image if
-          # your host needs it.
+          # All bundled tarballs are x86_64. Other architectures need matching downloads and pins.
           platforms: linux/amd64
-          push: true
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
 
+      - name: Runner and tools as uid 1001
+        env:
+          IMAGE: ${{ matrix.image }}
+          REF: ${{ steps.versions.outputs.name }}:${{ steps.versions.outputs.tag }}
+        run: |
+          set -euo pipefail
+          scripts/check-image.sh "$IMAGE" "$REF" | tee "versions-$IMAGE.txt"
+          {
+            echo "### $IMAGE runtime checks (uid 1001)"
+            echo '```text'
+            if [ -f swift-before.txt ]; then cat swift-before.txt; fi
+            cat "versions-$IMAGE.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the tested image
+        if: github.event_name != 'pull_request'
+        id: publish
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REF: ${{ steps.versions.outputs.name }}:${{ steps.versions.outputs.tag }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do docker push "$tag"; done <<< "$TAGS"
+          pin=$(docker image inspect "$REF" --format '{{index .RepoDigests 0}}')
+          echo "digest=${pin#*@}" >> "$GITHUB_OUTPUT"
+
       - name: Print the digest to pin
+        if: github.event_name != 'pull_request'
         env:
           NAME: ${{ steps.versions.outputs.name }}
           TAG: ${{ steps.versions.outputs.tag }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
           IMAGE: ${{ matrix.image }}
         run: |
           echo "Pin: $NAME:$TAG@$DIGEST"

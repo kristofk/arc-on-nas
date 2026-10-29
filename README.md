@@ -77,9 +77,10 @@ cgroup v2 on ext4):
   repository; the smoke test installs only the controller. The listener's restricted
   security context (from `listenerTemplate`) is schema-checked but has never run, which is why
   `arc-systems` enforces `baseline`, not `restricted`.
-- **The runner images, run.** [`images.yml`](.github/workflows/images.yml) built them once (see
-  Status above); no pod has pulled or run them, and no job has used the Swift toolchain in one.
-  The Swift checksum is the published one for the 6.4.0 Ubuntu 24.04 tarball.
+- **The runner images in a cluster.** No pod tested by this repository has pulled or run them,
+  and no registered ARC job is part of its CI. `images.yml` now tests the runner's .NET startup,
+  Swift execution and bundled tool versions in Docker as uid 1001 before publishing. That is
+  separate from a real registered job on your host.
 - **The warm cache under real builds,** including SwiftPM's lock behaviour across pods and
   `prune-cache.sh` on a real cache.
 - **The sizing numbers** in `.env.example` and [Sizing](#sizing): arithmetic from published
@@ -416,8 +417,8 @@ software still sees every host core.
 
 A toolchain is an image plus a scale set.
 
-1. Add `images/<name>/Dockerfile` `FROM` the same pinned `ghcr.io/actions/actions-runner` image,
-   install the toolchain (by checksum), remove `sudo` as the existing images do, and end with
+1. Add `images/<name>/Dockerfile` using the same pinned `ghcr.io/actions/actions-runner` source,
+   install the toolchain (by checksum), omit or remove `sudo` as the existing images do, and end with
    `USER 1001`. The runner must stay at `/home/runner` with `/home/runner/run.sh`, and the
    container must be named `runner` in the values (ARC's requirements).
 2. Add the image to the matrix in `.github/workflows/images.yml`, and its tag check to
@@ -476,10 +477,41 @@ set and therefore its cache claim; give untrusted-to-each-other repositories sep
 ## Building the images
 
 [`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift` and
-`images/ubuntu` on GitHub-hosted runners when you push a tag `v*` (or `gh workflow run Images`),
-pushes them to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, and
-prints `image:tag@sha256:digest` in the job summary. Pin that full reference in the values file:
-tags are overwritten by later builds, digests are not.
+`images/ubuntu` on GitHub-hosted runners. Pull requests build and run the images without
+publishing. Pushing a tag `v*` or running `gh workflow run Images --ref <branch or tag>` also
+publishes to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, after the
+runtime checks pass, and prints `image:tag@sha256:digest` in the job summary. Merging alone does
+not publish. Pin that full reference in the values file: tags are overwritten by later builds,
+digests are not. The committed `helm/` references remain the previous published build until an
+operator updates them deliberately.
+
+The new version tags are `6.4.0-2.338.0-ubuntu26.04-node24.22.0` (Swift) and
+`2.338.0-node24.22.0` (Ubuntu); each also gets a commit-suffixed tag. The Swift image runs on
+Ubuntu 26.04, with the runner, container hooks, Docker CLI and buildx copied from GitHub's
+pinned runner image. The Ubuntu image stays on 24.04. Both carry Node 24.22.0 at `/opt/node`,
+first on the job user's PATH. The Swift image is shared by ThunderBox's `swift` and
+`swift-image` sets and also bundles Caddy 2.11.7, buildctl 0.34.0, kubectl 1.36.5, Python
+(at least 3.10), curl and jq, matching AIDepartment's `ci/tools.pin`.
+
+Swift's 26.04 tarball is SHA-256-pinned and signature-checked during every build against the
+vendored public Swift 6.x release key (`images/swift/swift-release-key.asc`, fingerprint
+`52BB7E3DE28A71BE22EC05FFEF80A866B47A981F`). To bump Swift, verify its tarball and signature,
+update the version and SHA-256, and refresh the public key from swift.org if needed. The 30-day
+runner update rule applies to the Swift Dockerfile's source stage as well as Ubuntu's base.
+
+`scripts/check-image.sh swift|ubuntu IMAGE:TAG` checks the final image as uid 1001 without
+capabilities or privilege escalation: distribution, runner startup, hooks, internal Node,
+Docker CLI/buildx and bundled tools. The Swift check executes a small Swift program too.
+`images.yml` records the previous published image's `swift --version` and the new image's
+versions in its job summary. Run these builds in CI rather than on a busy NAS.
+
+For ThunderBox's rollout, update its `CI_ARC_COMMIT`, `CI_SWIFT_IMAGE`, `ci/swift-image.yaml`,
+`ci/image-runners.yaml` admission-policy image and `ci/ci-light.yaml` to the published pins.
+Point ci-light's Node tool-cache bootstrap at `/opt/node` while jobs still use `setup-node`.
+Drain all three sets and wait for their jobs to finish before pruning the old 24.04 Swift
+`.build` cache entries and replacing idle pods. Restore the existing counts after the upgrade,
+then check the tools in all three sets and run AID's CI and image jobs. The image PR provides
+host commands; this repository's CI cannot perform or verify that deployment.
 
 Packages pushed from a private repository are private. Either make the package public in its
 settings on GitHub, or create a pull secret with a token that has `read:packages` and uncomment
@@ -648,8 +680,8 @@ If your jobs need only a few hosts, add a
 
 **Does it run on arm64?** Not as written: the Swift image downloads the x86_64 toolchain, and
 `images.yml` builds `linux/amd64` only. k3s and the runner base image exist for arm64, so the
-`ubuntu` image could be built for it too (add `linux/arm64` to `platforms` in `images.yml`).
-Untested.
+images could be extended for it by selecting matching architecture-specific tool downloads
+and checksums and adding `linux/arm64` to `platforms` in `images.yml`. Untested.
 
 **How do I keep the runner image within 30 days of each `actions/runner` release without doing it
 by hand?** Nothing here does it. Watch the [actions/runner releases](https://github.com/actions/runner/releases)

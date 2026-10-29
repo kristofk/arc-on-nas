@@ -61,9 +61,15 @@ if grep -rnoE -- '--version [0-9]+\.[0-9]+\.[0-9]+|gha-runner-scale-set-[0-9]+\.
   problem "chart versions above differ from $chart"
 fi
 
-# The runner base image: the same tag and digest in every Dockerfile, and the tags in helm/.
+# The runner source image: the same tag and digest in every Dockerfile, and the tags in helm/.
 base=$(sed -n 's/^FROM \(ghcr.io\/actions\/actions-runner:[^ ]*\).*/\1/p' images/swift/Dockerfile)
 grep -q "^FROM $base$" images/ubuntu/Dockerfile || problem "images/ubuntu/Dockerfile: base differs from images/swift/Dockerfile"
+for arg in NODE_VERSION NODE_SHA256; do
+  value=$(sed -n "s/^ARG $arg=//p" images/swift/Dockerfile)
+  if [ -z "$value" ] || ! grep -q "^ARG $arg=$value$" images/ubuntu/Dockerfile; then
+    problem "images/ubuntu/Dockerfile: $arg differs from images/swift/Dockerfile"
+  fi
+done
 runner=${base#*:}
 runner=${runner%%@*}
 swift=$(sed -n 's/^ARG SWIFT_VERSION=//p' images/swift/Dockerfile)
@@ -74,8 +80,10 @@ image_re() {
   local ref="ghcr\.io/[^/ \"]+/arc-runner-$1:${2//./\\.}(@sha256:[0-9a-f]{64})?"
   echo "^ *image: ($ref|\"$ref\")( +#.*)?$"
 }
-grep -qE "$(image_re swift "$swift-$runner")" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
-grep -qE "$(image_re ubuntu "$runner")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
+node=$(sed -n 's/^ARG NODE_VERSION=//p' images/swift/Dockerfile)
+# Accept the last published pins or the new version tags; only an operator can select a digest.
+grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
+grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)
