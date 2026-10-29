@@ -81,7 +81,8 @@ image_re() {
   echo "^ *image: ($ref|\"$ref\")( +#.*)?$"
 }
 node=$(sed -n 's/^ARG NODE_VERSION=//p' images/swift/Dockerfile)
-# Accept the last published pins or the new version tags; only an operator can select a digest.
+# Temporary migration exception (#2): pin the first reviewed main/tag build in helm/, then
+# remove both optional suffixes below in that same follow-up. README records the rollout gate.
 grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
 grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 

@@ -478,12 +478,14 @@ set and therefore its cache claim; give untrusted-to-each-other repositories sep
 
 [`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift` and
 `images/ubuntu` on GitHub-hosted runners. Pull requests build and run the images without
-publishing. Pushing a tag `v*` or running `gh workflow run Images --ref <branch or tag>` also
-publishes to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, after the
+publishing, as do dispatches on feature branches. Pushing a tag `v*` or dispatching on `main`
+(`gh workflow run Images --ref main`) publishes to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, after the
 runtime checks pass, and prints `image:tag@sha256:digest` in the job summary. Merging alone does
 not publish. Pin that full reference in the values file: tags are overwritten by later builds,
 digests are not. The committed `helm/` references remain the previous published build until an
-operator updates them deliberately.
+operator updates them deliberately. Deploy a build from the reviewed merged commit (or a
+`v*` tag on it), with `CI_ARC_COMMIT` matching the image's revision. Branch-dispatch images
+recorded in PR #3 are historical test artifacts, not rollout pins.
 
 The new version tags are `6.4.0-2.338.0-ubuntu26.04-node24.22.0` (Swift) and
 `2.338.0-node24.22.0` (Ubuntu); each also gets a commit-suffixed tag. The Swift image runs on
@@ -501,17 +503,77 @@ runner update rule applies to the Swift Dockerfile's source stage as well as Ubu
 
 `scripts/check-image.sh swift|ubuntu IMAGE:TAG` checks the final image as uid 1001 without
 capabilities or privilege escalation: distribution, runner startup, hooks, internal Node,
-Docker CLI/buildx and bundled tools. The Swift check executes a small Swift program too.
-`images.yml` records the previous published image's `swift --version` and the new image's
-versions in its job summary. Run these builds in CI rather than on a busy NAS.
+Docker CLI/buildx and bundled tools. The runner must initialize the en-US culture and reach
+GitHub over TLS with an intentionally invalid token, producing an authentication rejection.
+The Swift check builds, links, runs and tests a tiny Foundation package in `/tmp` as uid 1001.
+`images.yml` records the new image's versions in its job summary. The one-time before/after
+Swift comparison is kept in PR #3, without pulling the old image on every build. Run these
+builds in CI rather than on a busy NAS.
 
-For ThunderBox's rollout, update its `CI_ARC_COMMIT`, `CI_SWIFT_IMAGE`, `ci/swift-image.yaml`,
-`ci/image-runners.yaml` admission-policy image and `ci/ci-light.yaml` to the published pins.
-Point ci-light's Node tool-cache bootstrap at `/opt/node` while jobs still use `setup-node`.
-Drain all three sets and wait for their jobs to finish before pruning the old 24.04 Swift
-`.build` cache entries and replacing idle pods. Restore the existing counts after the upgrade,
-then check the tools in all three sets and run AID's CI and image jobs. The image PR provides
-host commands; this repository's CI cannot perform or verify that deployment.
+**Post-merge pin follow-up (tracked on #2).** After the first successful Images run on the
+reviewed merged commit or its `v*` tag, record the immutable digests, revision and run URL in a
+follow-up PR. Update `helm/swift.yaml` and `helm/ubuntu.yaml` together, then make the Ubuntu/Node
+tag suffixes mandatory in `scripts/check-consistency.sh` (remove the temporary optional
+suffixes). Run `mise exec -- scripts/lint.sh`. Until that follow-up merges, the examples still
+use the old published images; do not use them to claim this migration is deployed. The pin
+follow-up must use the main/tag build, not the earlier PR-branch publication.
+
+**ThunderBox rollout and rollback (operator only).** First obtain Kristóf's decisions on the
+shared image and bundling versus an overlay. In a reviewed ThunderBox pin commit, record the
+previous pins, then update `CI_ARC_COMMIT`, `CI_SWIFT_IMAGE`, `ci/swift-image.yaml`, the admission
+policy in `ci/image-runners.yaml`, and `ci/ci-light.yaml` together from that main/tag build.
+Leave ci-light's graceful bootstrap fallback intact. AID's setup-node steps are all gated on
+`download == 'true'`; with the bundled Node on PATH they do not run. ThunderBox can retain the
+bootstrap (optionally pointing it at `/opt/node`) with its existing fallback, or remove it in
+its own reviewed change.
+
+Use ThunderBox's full-values installer, from the ThunderBox checkout on its operator's
+machine; these commands use that repository's configured host access, not this build box:
+
+```sh
+make ci-test
+make ci-sync
+make ci-redeploy-drained
+```
+
+`ci-redeploy-drained` uses `ci/install-drained.sh`: it takes the drain lock, drains swift-image
+then swift, and waits for ARC to acknowledge both twice (zero listener maxima/replicas and no
+ephemeral runners, runner pods or image checks; bounded by `WAIT_POLLS`, 240 polls of 30 seconds
+by default). Only then does it recreate the node, apply the `ci-image` bundle including the
+new admission-policy pin, install all three sets from full values, and restore swift before
+swift-image and restart listeners. Do not substitute `--reuse-values` plus list-index `--set`
+for those full values: Helm replaces lists whole. `ci-install-drained` alone is suitable only
+when the policy and node do not change; this migration changes the policy. ci-light is installed
+but is not drained by these targets; the node restart interrupts any running ci-light job, so
+the operator must schedule the window with that constraint.
+
+The ThunderBox rollout follow-up must put the one-time prune of old Ubuntu 24.04 Swift `.build`
+entries inside the install command, after the acknowledged drain and before restoring runners.
+That cache step must be reviewed with its pins before running the target; do not launch a
+parallel cache prune or delete BuildKit/unrelated caches. **Pruning cannot be undone**: rollback
+rebuilds a cold cache. After rollout check tools as uid 1001 in all three sets, pod imageIDs,
+AID's CI and image jobs, and the libdispatch crash tracked by AIDepartment#338.
+
+For rollback, revert the ThunderBox rollout pin commit (and its one-time prune hook) so the old
+`CI_ARC_COMMIT`, both image digests, full runner values and admission-policy pin are restored
+**together**, then use the same coordinated path:
+
+```sh
+# In ThunderBox; ROLLOUT_PIN_COMMIT is its reviewed migration commit, not the arc-on-nas commit.
+git revert "$ROLLOUT_PIN_COMMIT"
+make ci-test
+make ci-sync
+make ci-redeploy-drained
+```
+
+The recorded pre-migration pins are arc-on-nas commit
+`979f3b5f2d556cbca402f95694d1962d5e750937`, Swift
+`6.4.0-2.338.0@sha256:fc4829770130bba7ac913c5a53f14d77add6bc36ce8649971641a481294a5187`, and Ubuntu
+`2.338.0@sha256:7abaf816286ac48485493ef1f401378d4f7144dd5369ba1ee256f8c367733dc8`
+under `ghcr.io/kristofk/arc-runner-{swift,ubuntu}`. Confirm the actual pre-rollout pins in the
+ThunderBox commit before reverting. `helm rollback` alone cannot restore the admission policy
+and can leave swift-image's old pods refused. Re-check versions and AID jobs after rollback;
+the deleted cache entries remain deleted. This repository's CI cannot deploy or verify a host.
 
 Packages pushed from a private repository are private. Either make the package public in its
 settings on GitHub, or create a pull secret with a token that has `read:packages` and uncomment
