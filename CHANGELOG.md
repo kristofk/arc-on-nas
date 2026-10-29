@@ -15,8 +15,8 @@ All notable changes to this repository. The format follows
 - Image CI builds pull requests without publishing, checks the runner and tools as uid 1001,
   compiles, links, runs and tests a Foundation package, checks the runner's TLS/globalization
   with an expected GitHub authentication rejection, and publishes only from main or v* tags
-  with Node (and Swift's Ubuntu release) in their tags. Existing Helm image digests stay pinned until an operator updates them.
-
+  with Node (and Swift's Ubuntu release) in their tags. Existing Helm image digests stay pinned
+  until an operator updates them.
 - The Swift image omits the upstream image's lsb-release, software-properties-common and Docker
   daemon/containerd binaries; the Docker client, buildx, Git, curl, jq and container hooks remain.
 

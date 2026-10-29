@@ -479,9 +479,9 @@ set and therefore its cache claim; give untrusted-to-each-other repositories sep
 [`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift` and
 `images/ubuntu` on GitHub-hosted runners. Pull requests build and run the images without
 publishing, as do dispatches on feature branches. Pushing a tag `v*` or dispatching on `main`
-(`gh workflow run Images --ref main`) publishes to `ghcr.io/<owner>/arc-runner-swift` and `ghcr.io/<owner>/arc-runner-ubuntu`, after the
-runtime checks pass, and prints `image:tag@sha256:digest` in the job summary. Merging alone does
-not publish. Pin that full reference in the values file: tags are overwritten by later builds,
+(`gh workflow run Images --ref main`) publishes to `ghcr.io/<owner>/arc-runner-swift` and
+`ghcr.io/<owner>/arc-runner-ubuntu`, after the runtime checks pass, and prints
+`image:tag@sha256:digest` in the job summary. Merging alone does not publish. Pin that full reference in the values file: tags are overwritten by later builds,
 digests are not. The committed `helm/` references remain the previous published build until an
 operator updates them deliberately. Deploy a build from the reviewed merged commit (or a
 `v*` tag on it), with `CI_ARC_COMMIT` matching the image's revision. Branch-dispatch images
@@ -505,13 +505,15 @@ runner update rule applies to the Swift Dockerfile's source stage as well as Ubu
 capabilities or privilege escalation: distribution, runner startup, hooks, internal Node,
 Docker CLI/buildx and bundled tools. The runner must initialize the en-US culture and reach
 GitHub over TLS with an intentionally invalid token, producing an authentication rejection.
+That check depends on GitHub's API and the runner's diagnostic text; after an API or runner
+change, inspect the captured response and matcher before diagnosing an image dependency failure.
 The Swift check builds, links, runs and tests a tiny Foundation package in `/tmp` as uid 1001.
 `images.yml` records the new image's versions in its job summary. The one-time before/after
 Swift comparison is kept in PR #3, without pulling the old image on every build. Run these
 builds in CI rather than on a busy NAS.
 
-**Post-merge pin follow-up (tracked on #2).** After the first successful Images run on the
-reviewed merged commit or its `v*` tag, record the immutable digests, revision and run URL in a
+**Post-merge pin follow-up ([#4](https://github.com/kristofk/arc-on-nas/issues/4)).**
+After the first successful Images run on the reviewed merged commit or its `v*` tag, record the immutable digests, revision and run URL in a
 follow-up PR. Update `helm/swift.yaml` and `helm/ubuntu.yaml` together, then make the Ubuntu/Node
 tag suffixes mandatory in `scripts/check-consistency.sh` (remove the temporary optional
 suffixes). Run `mise exec -- scripts/lint.sh`. Until that follow-up merges, the examples still
@@ -527,8 +529,16 @@ Leave ci-light's graceful bootstrap fallback intact. AID's setup-node steps are 
 bootstrap (optionally pointing it at `/opt/node`) with its existing fallback, or remove it in
 its own reviewed change.
 
-Use ThunderBox's full-values installer, from the ThunderBox checkout on its operator's
-machine; these commands use that repository's configured host access, not this build box:
+**Rollout prerequisite: do not run the migration commands below until
+[ThunderBox#61](https://github.com/kristofk/ThunderBox/issues/61) is implemented, reviewed and
+merged.** The current `ci-redeploy-drained` target does not prune the old 24.04 Swift cache.
+The issue tracks that missing step and a possible drained `ci-image` + `ci-install` target
+without node recreation; choosing and adding that target belongs to ThunderBox.
+
+Once that prerequisite lands, use ThunderBox's reviewed full-values installer from the
+ThunderBox checkout on its operator's machine. The commands below describe its existing
+node-recreation path; use the reviewed replacement if #61 adds a target without node recreation.
+These commands use that repository's configured host access, not this build box:
 
 ```sh
 make ci-test
@@ -547,8 +557,8 @@ when the policy and node do not change; this migration changes the policy. ci-li
 but is not drained by these targets; the node restart interrupts any running ci-light job, so
 the operator must schedule the window with that constraint.
 
-The ThunderBox rollout follow-up must put the one-time prune of old Ubuntu 24.04 Swift `.build`
-entries inside the install command, after the acknowledged drain and before restoring runners.
+The [ThunderBox#61](https://github.com/kristofk/ThunderBox/issues/61) rollout follow-up must put
+the one-time prune of old Ubuntu 24.04 Swift `.build` entries inside the install command, after the acknowledged drain and before restoring runners.
 That cache step must be reviewed with its pins before running the target; do not launch a
 parallel cache prune or delete BuildKit/unrelated caches. **Pruning cannot be undone**: rollback
 rebuilds a cold cache. After rollout check tools as uid 1001 in all three sets, pod imageIDs,
