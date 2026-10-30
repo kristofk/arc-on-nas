@@ -2,3 +2,4 @@
 failure-threshold: warning
 trustedRegistries:
   - ghcr.io
+  - docker.io

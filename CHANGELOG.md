@@ -6,6 +6,20 @@ All notable changes to this repository. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Swift runners use Ubuntu 26.04 and swift.org's matching Swift 6.4.0 build, verified by its
+  release signature and pinned SHA-256, while retaining GitHub's runner and container hooks.
+- Both runner images bundle Node 24.22.0; the shared Swift/image runner also carries Caddy
+  2.11.7, Python 3.10 or newer, curl, jq, buildctl 0.34.0 and kubectl 1.36.5 (#2).
+- Image CI builds pull requests without publishing, checks the runner and tools as uid 1001,
+  compiles, links, runs and tests a Foundation package, checks the runner's TLS/globalization
+  with an expected GitHub authentication rejection, and publishes only from main or v* tags
+  with Node (and Swift's Ubuntu release) in their tags. Existing Helm image digests stay pinned
+  until an operator updates them.
+- The Swift image omits the upstream image's lsb-release, software-properties-common and Docker
+  daemon/containerd binaries; the Docker client, buildx, Git, curl, jq and container hooks remain.
+
 ## [0.1.0] - 2026-10-09
 
 First release.
