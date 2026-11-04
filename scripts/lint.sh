@@ -47,13 +47,13 @@ scaleset_chart=.cache/charts/gha-runner-scale-set-$chart_version
 
 step "helm lint"
 helm lint "$controller_chart" -f helm/controller.yaml --namespace arc-systems
-for s in swift ubuntu; do
+for s in swift ubuntu browser; do
   helm lint "$scaleset_chart" -f "helm/$s.yaml" --set githubConfigUrl="$repo_url" --namespace arc-runners
 done
 
 step "helm template"
 helm template arc "$controller_chart" -f helm/controller.yaml --namespace arc-systems > "$out/controller.yaml"
-for s in swift ubuntu; do
+for s in swift ubuntu browser; do
   helm template "$s" "$scaleset_chart" -f "helm/$s.yaml" --set githubConfigUrl="$repo_url" \
     --namespace arc-runners > "$out/$s.yaml"
   # The pods ARC will create from the templates, as Pod objects a schema can check.
@@ -71,9 +71,9 @@ step kubeconform
 kubeconform -strict -summary -ignore-filename-pattern kustomization.yaml manifests/
 # ARC's own resources (AutoscalingRunnerSet) have no published schema; everything else is checked.
 kubeconform -strict -summary -skip AutoscalingRunnerSet \
-  "$out/controller.yaml" "$out/swift.yaml" "$out/ubuntu.yaml" \
-  "$out/swift-runner-pod.yaml" "$out/ubuntu-runner-pod.yaml" \
-  "$out/swift-listener-pod.yaml" "$out/ubuntu-listener-pod.yaml"
+  "$out/controller.yaml" "$out/swift.yaml" "$out/ubuntu.yaml" "$out/browser.yaml" \
+  "$out/swift-runner-pod.yaml" "$out/ubuntu-runner-pod.yaml" "$out/browser-runner-pod.yaml" \
+  "$out/swift-listener-pod.yaml" "$out/ubuntu-listener-pod.yaml" "$out/browser-listener-pod.yaml"
 
 step consistency
 scripts/check-consistency.sh

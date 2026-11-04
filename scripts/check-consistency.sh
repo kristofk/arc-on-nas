@@ -22,7 +22,7 @@ grep -q "HTTPS_PROXY: http://$proxy:3128" docker-compose.yml || problem "docker-
 if grep -nE 'HTTPS?_PROXY: ' docker-compose.yml | grep -v "http://$proxy:3128"; then problem "docker-compose.yml: proxy URL above differs"; fi
 grep -q "cidr: $proxy/32" manifests/networkpolicy-runners.yaml || problem "manifests/networkpolicy-runners.yaml: ipBlock is not $proxy/32"
 grep -q "acl runners src $subnet " squid.conf || problem "squid.conf: 'acl runners src' does not include $subnet"
-for f in helm/swift.yaml helm/ubuntu.yaml; do
+for f in helm/swift.yaml helm/ubuntu.yaml helm/browser.yaml; do
   n=$(grep -c "url: http://$proxy:3128" "$f" || true)
   [ "$n" -eq 2 ] || problem "$f: expected the http and https proxy URLs to be http://$proxy:3128"
 done
@@ -39,13 +39,13 @@ grep -q "GATEWAY: $gateway$" .github/workflows/ci.yml || problem ".github/workfl
 mount=$(sed -n 's/^ *- \${CACHE_DIR[^}]*}:\(\/[^ ]*\).*/\1/p' docker-compose.yml)
 grep -q "path: $mount/" manifests/cache.yaml || problem "manifests/cache.yaml: hostPath is not under the compose mount $mount"
 claim=$(awk '/^kind: PersistentVolumeClaim/ {f=1} f && /^  name:/ {print $2; exit}' manifests/cache.yaml)
-for f in helm/swift.yaml helm/ubuntu.yaml; do
+for f in helm/swift.yaml helm/ubuntu.yaml helm/browser.yaml; do
   grep -q "claimName: $claim$" "$f" || problem "$f: claimName is not $claim"
   grep -q "mountPath: /home/runner/cache$" "$f" || problem "$f: the cache is not mounted at /home/runner/cache"
   grep -q "runAsUser: 1001$" "$f" || problem "$f: runAsUser is not 1001"
   grep -q "name: arc-gha-rs-controller$" "$f" || problem "$f: controllerServiceAccount is not arc-gha-rs-controller (release arc)"
 done
-for f in images/swift/Dockerfile images/ubuntu/Dockerfile; do
+for f in images/swift/Dockerfile images/ubuntu/Dockerfile images/browser/Dockerfile; do
   grep -q "^USER 1001$" "$f" || problem "$f: USER is not 1001"
 done
 
@@ -63,13 +63,24 @@ fi
 
 # The runner source image: the same tag and digest in every Dockerfile, and the tags in helm/.
 base=$(sed -n 's/^FROM \(ghcr.io\/actions\/actions-runner:[^ ]*\).*/\1/p' images/swift/Dockerfile)
-grep -q "^FROM $base$" images/ubuntu/Dockerfile || problem "images/ubuntu/Dockerfile: base differs from images/swift/Dockerfile"
-for arg in NODE_VERSION NODE_SHA256; do
-  value=$(sed -n "s/^ARG $arg=//p" images/swift/Dockerfile)
-  if [ -z "$value" ] || ! grep -q "^ARG $arg=$value$" images/ubuntu/Dockerfile; then
-    problem "images/ubuntu/Dockerfile: $arg differs from images/swift/Dockerfile"
-  fi
+for f in images/ubuntu/Dockerfile images/browser/Dockerfile; do
+  grep -q "^FROM $base$" "$f" || problem "$f: base differs from images/swift/Dockerfile"
+  for arg in NODE_VERSION NODE_SHA256; do
+    value=$(sed -n "s/^ARG $arg=//p" images/swift/Dockerfile)
+    if [ -z "$value" ] || ! grep -q "^ARG $arg=$value$" "$f"; then
+      problem "$f: $arg differs from images/swift/Dockerfile"
+    fi
+  done
 done
+# The browser image is the ubuntu image plus Chrome's libraries: every package installed in
+# images/ubuntu/Dockerfile is installed in images/browser/Dockerfile too.
+packages() {
+  awk '/apt-get install/ {f = 1; next} f && /^ *&&/ {f = 0} f {gsub(/\\/, ""); print}' "$1" \
+    | tr -s ' ' '\n' | sed '/^$/d' | sort -u
+}
+[ -n "$(packages images/ubuntu/Dockerfile)" ] || { echo "cannot read the packages in images/ubuntu/Dockerfile"; exit 1; }
+missing=$(comm -23 <(packages images/ubuntu/Dockerfile) <(packages images/browser/Dockerfile) | paste -sd ' ' -)
+[ -z "$missing" ] || problem "images/browser/Dockerfile: does not install the ubuntu image's $missing"
 runner=${base#*:}
 runner=${runner%%@*}
 swift=$(sed -n 's/^ARG SWIFT_VERSION=//p' images/swift/Dockerfile)
@@ -86,6 +97,7 @@ node=$(sed -n 's/^ARG NODE_VERSION=//p' images/swift/Dockerfile)
 # remove both optional suffixes below in that same follow-up. README records the rollout gate.
 grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swift.yaml || problem "helm/swift.yaml: image tag is not $swift-$runner"
 grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
+grep -qE "$(image_re browser "$runner-node$node")" helm/browser.yaml || problem "helm/browser.yaml: image tag is not $runner-node$node"
 
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)

@@ -406,8 +406,8 @@ allocatable plus `kube-reserved`). With a `.env`, it also checks the sizing agai
 BUDGET_CPUS=10 BUDGET_GIB=17 scripts/preflight.sh    # on the example host: the values above
 ```
 
-The `ubuntu` set (1 CPU, 2 GiB per pod) shares the same allocatable: when the Swift pods fill it,
-its pods wait, and the other way round. Pod sizes are a trade: 2 CPUs and 3 GiB suits a
+The `ubuntu` and `browser` sets (1 CPU, 2 GiB per pod) share the same allocatable: when the Swift pods fill it,
+their pods wait, and the other way round. Pod sizes are a trade: 2 CPUs and 3 GiB suits a
 medium Swift package; fewer, larger pods finish each job sooner, more, smaller pods run more jobs
 at once. Keep requests equal to limits either way, and tell the tools in the job the pod's CPU
 count (`RUNNER_CPUS`, or the cgroup quota as `examples/workflow.yml` reads it): inside a pod, the
@@ -476,11 +476,11 @@ set and therefore its cache claim; give untrusted-to-each-other repositories sep
 
 ## Building the images
 
-[`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift` and
-`images/ubuntu` on GitHub-hosted runners. Pull requests build and run the images without
+[`.github/workflows/images.yml`](.github/workflows/images.yml) builds `images/swift`,
+`images/ubuntu` and `images/browser` on GitHub-hosted runners. Pull requests build and run the images without
 publishing, as do dispatches on feature branches. Pushing a tag `v*` or dispatching on `main`
-(`gh workflow run Images --ref main`) publishes to `ghcr.io/<owner>/arc-runner-swift` and
-`ghcr.io/<owner>/arc-runner-ubuntu`, after the runtime checks pass, and prints
+(`gh workflow run Images --ref main`) publishes to `ghcr.io/<owner>/arc-runner-swift`,
+`ghcr.io/<owner>/arc-runner-ubuntu` and `ghcr.io/<owner>/arc-runner-browser`, after the runtime checks pass, and prints
 `image:tag@sha256:digest` in the job summary. Merging alone does not publish. Pin that full reference in the values file: tags are overwritten by later builds,
 digests are not. The committed `helm/` references remain the previous published build until an
 operator updates them deliberately. Deploy a build from the reviewed merged commit (or a
@@ -495,19 +495,32 @@ first on the job user's PATH. The Swift image is shared by ThunderBox's `swift` 
 `swift-image` sets and also bundles Caddy 2.11.7, buildctl 0.34.0, kubectl 1.36.5, Python
 (at least 3.10), curl and jq, matching AIDepartment's `ci/tools.pin`.
 
+The browser image (`2.338.0-node24.22.0`, like Ubuntu's) is the Ubuntu image, step for step, plus
+the shared libraries and fonts headless [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)
+needs: the packages in its `deb.deps`, under Ubuntu 24.04's names, without GTK, Vulkan's loader,
+libcurl and xdg-utils, which headless Chrome does not load. It does not contain Chrome: a job
+installs the version it pins (into the warm cache, for example), and starts it with
+`--no-sandbox --disable-dev-shm-usage`, since a runner pod has no user namespaces for Chrome's
+sandbox and a small `/dev/shm`, and with `--use-angle=swiftshader --enable-unsafe-swiftshader` for
+WebGL without a GPU. `scripts/check-consistency.sh` keeps its base, Node and packages a superset of
+the Ubuntu image's; bump both Dockerfiles together.
+
 Swift's 26.04 tarball is SHA-256-pinned and signature-checked during every build against the
 vendored public Swift 6.x release key (`images/swift/swift-release-key.asc`, fingerprint
 `52BB7E3DE28A71BE22EC05FFEF80A866B47A981F`). To bump Swift, verify its tarball and signature,
 update the version and SHA-256, and refresh the public key from swift.org if needed. The 30-day
 runner update rule applies to the Swift Dockerfile's source stage as well as Ubuntu's base.
 
-`scripts/check-image.sh swift|ubuntu IMAGE:TAG` checks the final image as uid 1001 without
+`scripts/check-image.sh swift|ubuntu|browser IMAGE:TAG` checks the final image as uid 1001 without
 capabilities or privilege escalation: distribution, runner startup, hooks, internal Node,
 Docker CLI/buildx and bundled tools. The runner must initialize the en-US culture and reach
 GitHub over TLS with an intentionally invalid token, producing an authentication rejection.
 That check depends on GitHub's API and the runner's diagnostic text; after an API or runner
 change, inspect the captured response and matcher before diagnosing an image dependency failure.
 The Swift check builds, links, runs and tests a tiny Foundation package in `/tmp` as uid 1001.
+The browser check downloads the Chrome for Testing build pinned in `images/browser/Dockerfile`
+(by version and SHA-256), requires `ldd` to resolve all its libraries, and starts it headless with
+the flags above, as uid 1001: WebGL must read back the pixel it cleared and Canvas 2D must draw text.
 `images.yml` records the new image's versions in its job summary. The one-time before/after
 Swift comparison is kept in PR #3, without pulling the old image on every build. Run these
 builds in CI rather than on a busy NAS.
@@ -758,7 +771,7 @@ and checksums and adding `linux/arm64` to `platforms` in `images.yml`. Untested.
 **How do I keep the runner image within 30 days of each `actions/runner` release without doing it
 by hand?** Nothing here does it. Watch the [actions/runner releases](https://github.com/actions/runner/releases)
 (GitHub's Watch → Custom → Releases), or configure Dependabot's `docker` ecosystem on
-`images/swift` and `images/ubuntu` in your copy to propose the new base digest; then rebuild with
+`images/swift`, `images/ubuntu` and `images/browser` in your copy to propose the new base digest; then rebuild with
 `images.yml` and pin the new digests in `helm/`. See [Operations](#operations).
 
 **Do `actions/cache`, artifacts and the `actions/setup-*` actions work?** Untested. The runner
@@ -808,7 +821,7 @@ change recreates the node, every pod restarts and the running job fails. Drain f
 |---|---|
 | `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
 | `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim. |
-| `helm/` | Values for the controller and the `swift` and `ubuntu` scale sets. |
+| `helm/` | Values for the controller and the `swift`, `ubuntu` and `browser` scale sets. |
 | `images/` | The runner images. |
 | `scripts/` | `preflight.sh`, `trial.sh`, `register.sh`, `warm.sh`, `prune-cache.sh`; `lint.sh` and `check-consistency.sh` for development. |
 | `examples/workflow.yml` | A consumer repository's workflow. |

@@ -6,6 +6,14 @@ All notable changes to this repository. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A browser runner image, `arc-runner-browser`, and its example scale set `helm/browser.yaml`: the
+  Ubuntu image plus the shared libraries and fonts headless Chrome for Testing needs, so jobs can
+  run page tests without installing packages. Image CI downloads a pinned Chrome for Testing build,
+  checks its libraries with `ldd` and starts it headless as uid 1001, drawing with WebGL
+  (SwiftShader) and Canvas 2D.
+
 ### Changed
 
 - Swift runners use Ubuntu 26.04 and swift.org's matching Swift 6.4.0 build, verified by its

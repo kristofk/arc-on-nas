@@ -1,13 +1,14 @@
 name: Images
 
 # Builds the runner images in images/ and pushes them to the GitHub Container Registry of the
-# repository's owner: ghcr.io/<owner>/arc-runner-swift and ghcr.io/<owner>/arc-runner-ubuntu.
+# repository's owner: ghcr.io/<owner>/arc-runner-swift, ghcr.io/<owner>/arc-runner-ubuntu and
+# ghcr.io/<owner>/arc-runner-browser (the ubuntu image plus headless Chrome's libraries).
 # Pull requests and branch dispatches build and test without publishing. A tag v* or a manual
 # dispatch on main publishes after runtime checks: `gh workflow run Images --ref main`.
 #
 # Each image is tagged with its runner and Node versions (plus Swift and Ubuntu for swift) and with
 # the commit. Tags move; the digest does not. The job summary prints image@digest: put that in
-# helm/swift.yaml or helm/ubuntu.yaml.
+# helm/swift.yaml, helm/ubuntu.yaml or helm/browser.yaml.
 #
 # A package pushed from a private repository is private: make it public in the package's
 # settings, or give the cluster a pull secret (README, "Building the images").
@@ -37,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [swift, ubuntu]
+        image: [swift, ubuntu, browser]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

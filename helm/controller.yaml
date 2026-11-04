@@ -7,7 +7,8 @@
 #     --version 0.15.0 --namespace arc-systems -f helm/controller.yaml
 #
 # The controller needs no GitHub credential of its own and no proxy setting here: it reaches
-# GitHub with each scale set's credential and proxy (helm/swift.yaml, helm/ubuntu.yaml).
+# GitHub with each scale set's credential and proxy (helm/swift.yaml, helm/ubuntu.yaml,
+# helm/browser.yaml).
 
 replicaCount: 1
 

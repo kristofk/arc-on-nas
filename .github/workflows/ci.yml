@@ -172,7 +172,7 @@ jobs:
           set -euo pipefail
           # The pods ARC would create from each scale set's template. Their service account comes
           # with the scale set's chart, which is not installed here: the default one stands in.
-          for s in swift ubuntu; do
+          for s in swift ubuntu browser; do
             docker compose run --rm -T helm template "$s" "$CHARTS/gha-runner-scale-set" \
               --version "$CHART_VERSION" --namespace arc-runners -f "helm/$s.yaml" \
               --set githubConfigUrl=https://github.com/OWNER/REPO > "$RUNNER_TEMP/$s.yaml"
