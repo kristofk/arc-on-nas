@@ -12,7 +12,8 @@ All notable changes to this repository. The format follows
   Ubuntu image plus the shared libraries and fonts headless Chrome for Testing needs, so jobs can
   run page tests without installing packages. Image CI downloads a pinned Chrome for Testing build,
   checks its libraries with `ldd` and starts it headless as uid 1001, drawing with WebGL
-  (SwiftShader) and Canvas 2D.
+  (SwiftShader) and Canvas 2D. `helm/browser.yaml` pins the build of Images run 41937445042 on
+  main by digest.
 
 ### Changed
 

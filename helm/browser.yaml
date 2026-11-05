@@ -71,9 +71,10 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        # Built from images/browser/Dockerfile. Not pinned to a digest until the first published
-        # build: put its image@sha256 from images.yml's job summary here (yours, in your copy).
-        image: ghcr.io/kristofk/arc-runner-browser:2.338.0-node24.22.0
+        # Built from images/browser/Dockerfile by Images run 41937445042 on main (2100680). Pinned
+        # to the repository owner's build; replace it with yours.
+        # yamllint disable-line rule:line-length
+        image: ghcr.io/kristofk/arc-runner-browser:2.338.0-node24.22.0@sha256:1e289f64307299a0d67f793abc08cf29beb0e2c96a2b23b754f93c34b95d307b
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         env:
