@@ -385,12 +385,14 @@ jobs:
           EOF
           refused 'exceeded quota: budget' apply -f - < "$RUNNER_TEMP/two.json"
           # writer <name> <dir> <MiB>: a pod with a 64Mi limit that writes <MiB> into <dir>, then
-          # waits; /scratch is an emptyDir, anything else is in the container's own layer.
+          # waits; /scratch is an emptyDir, anything else is in the container's own layer. Random
+          # data, not zeros: on a compressing filesystem (ZFS) zeros take no blocks, and the kubelet
+          # counts blocks.
           writer() {
             jq -n --arg name "$1" --arg dir "$2" --arg mib "$3" --arg image "$BUSYBOX_IMAGE" '
               {apiVersion: "v1", kind: "Pod", metadata: {name: $name}, spec: {restartPolicy: "Never",
                 containers: [{name: "w", image: $image,
-                  command: ["sh", "-c", "dd if=/dev/zero of=\($dir)/fill bs=1M count=\($mib) && sleep 600"],
+                  command: ["sh", "-c", "dd if=/dev/urandom of=\($dir)/fill bs=1M count=\($mib) && sleep 600"],
                   resources: {limits: {"ephemeral-storage": "64Mi"}}}]}}
               | if $dir == "/scratch" then .spec.volumes = [{name: "s", emptyDir: {}}]
                   | .spec.containers[0].volumeMounts = [{name: "s", mountPath: "/scratch"}] else . end' \
