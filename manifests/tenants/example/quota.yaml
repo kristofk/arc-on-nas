@@ -1,0 +1,65 @@
+# The example's budget (README, "Tenant namespaces", for the arithmetic): small, enough for the
+# smoke test's pods. Every container gets a memory and an ephemeral-storage limit from the
+# LimitRange below when it names none.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: budget
+spec:
+  hard:
+    requests.cpu: "500m"
+    # CPU limits only throttle; the k3s container's CPU cap and weight are what protect the host.
+    limits.cpu: "2"
+    requests.memory: 512Mi
+    limits.memory: 1Gi
+    # Disk on the node: emptyDir volumes, the containers' writable layers and their logs (README,
+    # "Tenant namespaces", "Disk").
+    requests.ephemeral-storage: 1Gi
+    limits.ephemeral-storage: 1Gi
+    pods: "10"
+    services: "5"
+    # A NodePort answers on every address of the node and leads to its pods as their own address
+    # does, so only a tenant with an ingress policy for it gets one (README, "Reaching a tenant's
+    # service"). There is no load balancer.
+    services.nodeports: "0"
+    services.loadbalancers: "0"
+    configmaps: "10"
+    # Every object is a row in k3s's datastore, which the runners need too: a bound on each kind.
+    count/deployments.apps: "5"
+    count/replicasets.apps: "50"
+    count/statefulsets.apps: "5"
+    count/daemonsets.apps: "0"
+    count/jobs.batch: "5"
+    count/cronjobs.batch: "0"
+    count/horizontalpodautoscalers.autoscaling: "0"
+    count/poddisruptionbudgets.policy: "0"
+    count/leases.coordination.k8s.io: "5"
+    count/serviceaccounts: "5"
+    secrets: "10"
+    persistentvolumeclaims: "2"
+    # Every claim's requested size together, whatever binds it: its cache volume
+    # (cache-volume.yaml) or local-path.
+    requests.storage: 2Gi
+    # local-path, k3s's default StorageClass, makes a directory on the node for each claim and
+    # does not enforce its size: this counts requests, not bytes on disk.
+    local-path.storageclass.storage.k8s.io/requests.storage: 1Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 128Mi
+        ephemeral-storage: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 32Mi
+        ephemeral-storage: 32Mi
+      max:
+        cpu: "1"
+        memory: 512Mi
+        ephemeral-storage: 512Mi

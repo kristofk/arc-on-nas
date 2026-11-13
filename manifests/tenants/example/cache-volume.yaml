@@ -1,0 +1,34 @@
+# A tenant's cache on the host (README, "Tenant namespaces", "A tenant's cache on the host"): a
+# static hostPath PersistentVolume. Cluster-scoped, so the admin applies it, with the rest of this
+# directory. Pod Security's baseline level and ../admission.yaml forbid hostPath in a tenant's
+# pod, but allow it to mount a claim.
+#
+# The path is the k3s container's: on a host, a filesystem of its own with a quota, bind-mounted
+# there by docker-compose.override.yml. The directory must exist and belong to the user the
+# tenant's pod runs as before a pod mounts it.
+#
+# Bound to the one claim named in claimRef: an unclaimed volume binds to any claim that fits, in
+# any namespace, and so to another tenant's.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: example-cache
+  labels:
+    app.kubernetes.io/part-of: arc-on-nas
+spec:
+  capacity:
+    # The host filesystem's quota. Informational: Kubernetes does not limit a hostPath volume's size.
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  # Deleting the claim keeps the volume and the data; it then binds to nothing until the admin
+  # removes claimRef.uid or recreates it.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: example
+    name: cache
+  hostPath:
+    path: /var/lib/example-cache
+    # Fail rather than create it root-owned.
+    type: Directory

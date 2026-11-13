@@ -111,82 +111,12 @@ grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swif
 grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 grep -qE "$(image_re browser "$runner-node$node")" helm/browser.yaml || problem "helm/browser.yaml: image tag is not $runner-node$node"
 
-# The build farm's cache (README, "Tenant namespaces"): the volume and the claim name each other,
-# and Buildbarn's files (cache.libsonnet) together stay below the volume's capacity, which is the
-# host directory's quota.
-farm_pv=manifests/tenants/build-farm/cache-volume.yaml
-farm_pvc=manifests/tenants/build-farm/cache-claim.yaml
-farm_cache=manifests/tenants/build-farm/server/config/cache.libsonnet
-pv_name=$(yq '.metadata.name' "$farm_pv")
-pvc_name=$(yq '.metadata.name' "$farm_pvc")
-[ "$(yq '.spec.claimRef.namespace + "/" + .spec.claimRef.name' "$farm_pv")" = "build-farm/$pvc_name" ] \
-  || problem "$farm_pv: claimRef is not build-farm/$pvc_name"
-[ "$(yq '.spec.volumeName' "$farm_pvc")" = "$pv_name" ] || problem "$farm_pvc: volumeName is not $pv_name"
-capacity=$(yq '.spec.capacity.storage' "$farm_pv")
-[ "$(yq '.spec.resources.requests.storage' "$farm_pvc")" = "$capacity" ] \
-  || problem "$farm_pvc: the requested size is not the volume's $capacity"
-case "$capacity" in
-  *Gi) capacity_bytes=$(( ${capacity%Gi} * 1024 * 1024 * 1024 )) ;;
-  *) problem "$farm_pv: capacity $capacity is not in Gi"; capacity_bytes=0 ;;
-esac
-# shellcheck disable=SC2016 # $x is yq's variable
-cache_bytes=$(jsonnet "$farm_cache" \
-  | yq -p json '[.. | select(tag == "!!map" and has("sizeBytes")) | .sizeBytes] | .[] as $x ireduce (0; . + $x)')
-echo "build farm cache: $cache_bytes bytes of files, volume $capacity"
-[ "$cache_bytes" -gt 0 ] && [ "$cache_bytes" -lt "$capacity_bytes" ] \
-  || problem "$farm_cache: the files' total $cache_bytes bytes is not below $capacity ($farm_pv)"
-
-# The build farm's server (README, "Tenant namespaces", "The build farm's server"): the storage pod
-# mounts that claim where cache.libsonnet puts its files, makes the directories it names, and runs
-# as the host directory's owner; the frontend runs the same bb-storage as the storage pod.
-farm_sts=manifests/tenants/build-farm/server/storage.yaml
-farm_frontend=manifests/tenants/build-farm/server/frontend.yaml
-sts='select(.kind == "StatefulSet") | .spec.template.spec'
-[ "$(yq "$sts | .volumes[] | select(.name == \"cache\") | .persistentVolumeClaim.claimName" "$farm_sts")" = "$pvc_name" ] \
-  || problem "$farm_sts: the volume cache is not the claim $pvc_name"
-mount_path=$(jsonnet -e "(import '$farm_cache').mountPath" | yq -p json '.')
-for c in initContainers containers; do
-  m=$(yq "$sts | .${c}[] | .volumeMounts[] | select(.name == \"cache\") | .mountPath" "$farm_sts" | sort -u)
-  [ "$m" = "$mount_path" ] || problem "$farm_sts: $c mount the cache at ${m:-nothing}, not $mount_path"
-done
-dirs=$(jsonnet -e "(import '$farm_cache').directories" | yq -p json '.[]' | sort)
-made=$(yq "$sts | .initContainers[] | select(.name == \"directories\") | .command[] | select(test(\"^/\"))" "$farm_sts" | sort)
-[ "$dirs" = "$made" ] || problem "$farm_sts: the init container makes other directories than $farm_cache names"
-[ "$(yq "$sts | .securityContext.runAsUser + \":\" + .securityContext.runAsGroup" "$farm_sts")" = 65532:65532 ] \
-  || problem "$farm_sts: the storage pod does not run as 65532:65532, the owner of the host directory"
-storage_image=$(yq "$sts | .containers[] | select(.name == \"storage\") | .image" "$farm_sts")
-frontend_image=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | .image' "$farm_frontend")
-[ "$storage_image" = "$frontend_image" ] || problem "$farm_frontend: the frontend's image is not the storage pod's $storage_image"
-echo "build farm server: $storage_image, cache at $mount_path"
-
-# The build farm's network (README, "Tenant namespaces", "The build farm's network"): the
-# forwarder connects to the frontend's NodePort on the node, from a fixed address of its own that
-# the frontend's NetworkPolicy lets in; its alias is a name the frontend's certificate carries; and
-# the frontend reads its key pair where the Secret is mounted.
-farm_forward=farm-forward.yml
-farm_policy=manifests/tenants/build-farm/networkpolicy.yaml
-farm_config=manifests/tenants/build-farm/server/config/frontend.jsonnet
-node_ip=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
-node_port=$(yq 'select(.metadata.name == "frontend-external") | .spec.ports[] | select(.name == "grpc") | .nodePort' "$farm_frontend")
-grep -q "^ *TARGET=TCP4:$node_ip:$node_port$" "$farm_forward" || problem "$farm_forward: the forwarder's target is not $node_ip:$node_port"
-[ "$(yq 'select(.metadata.name == "frontend-external") | .spec.externalTrafficPolicy' "$farm_frontend")" = Local ] \
-  || problem "$farm_frontend: frontend-external does not keep the source address (externalTrafficPolicy Local)"
-farm_fwd=$(yq '.services.forward.networks.runners.ipv4_address' "$farm_forward")
-grep -q "^ *runners=$farm_fwd$" "$farm_forward" || problem "$farm_forward: the address it does not listen on is not its own $farm_fwd"
-[ "${farm_fwd%.*}.0/24" = "$subnet" ] || problem "$farm_forward: the forwarder's address $farm_fwd is not in $subnet"
-case "$farm_fwd" in "$node_ip"|"$proxy"|"$forward"|"$gateway") problem "$farm_forward: $farm_fwd is taken" ;; esac
-[ "$(yq '.spec.ingress[].from[] | select(has("ipBlock")) | .ipBlock.cidr' "$farm_policy")" = "$farm_fwd/32" ] \
-  || problem "$farm_policy: the ipBlock is not the forwarder's $farm_fwd/32"
-alias=$(yq '.services.forward.networks.clients.aliases[0]' "$farm_forward")
-grep -q "^ *names=(.* ${alias}[ )]" scripts/farm-tls.sh || problem "scripts/farm-tls.sh: the certificate does not name the forwarder's alias $alias"
-tls_mount=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | .volumeMounts[] | select(.name == "tls") | .mountPath' "$farm_frontend")
-tls_secret=$(yq 'select(.kind == "Deployment") | .spec.template.spec.volumes[] | select(.name == "tls") | .secret.secretName' "$farm_frontend")
-for f in certificatePath privateKeyPath; do
-  path=$(jsonnet "$farm_config" | yq -p json ".grpcServers[0].tls.serverKeyPair.files.$f")
-  [ "${path%/*}" = "$tls_mount" ] || problem "$farm_config: $f $path is not in the key pair's mount $tls_mount"
-done
-grep -q "^secret=$tls_secret$" scripts/farm-tls.sh || problem "scripts/farm-tls.sh: the default Secret is not $tls_secret"
-echo "build farm network: $farm_fwd -> $node_ip:$node_port, alias $alias, key pair $tls_secret at $tls_mount"
+# The example tenant's cache volume and claim name each other.
+example_pv=manifests/tenants/example/cache-volume.yaml
+example_pvc=manifests/tenants/example/cache-claim.yaml
+[ "$(yq '.spec.claimRef.namespace + "/" + .spec.claimRef.name' "$example_pv")" = "example/$(yq '.metadata.name' "$example_pvc")" ] \
+  || problem "$example_pv: claimRef is not its claim's"
+[ "$(yq '.spec.volumeName' "$example_pvc")" = "$(yq '.metadata.name' "$example_pv")" ] || problem "$example_pvc: volumeName is not its volume's"
 
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)

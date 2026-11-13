@@ -7,7 +7,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: build-farm
+  name: example
   labels:
     arc-on-nas/tenant: "true"
     pod-security.kubernetes.io/enforce: baseline

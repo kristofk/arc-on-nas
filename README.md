@@ -497,18 +497,19 @@ set and therefore its cache claim; give untrusted-to-each-other repositories sep
 Optional. A tenant namespace is one that somebody other than the cluster admin deploys into:
 another project's trial, a build farm, an agent that measures what it builds. Each tenant user
 gets a client certificate that is allowed their namespaces and nothing else: no shell on the
-host, no admin kubeconfig, no other namespace. [`manifests/tenants/`](manifests/tenants) ships two,
-`zuul-trial` and `build-farm`, with two users; rename the directories and edit
-`base/rolebinding.yaml` for yours.
+host, no admin kubeconfig, no other namespace. [`manifests/tenants/`](manifests/tenants) ships one,
+`zuul-trial`, with two users, and [`example/`](manifests/tenants/example) to copy for yours (below,
+"Adding a tenant"); edit `base/rolebinding.yaml` for your users. A tenant may also be kept in
+another repository, with its software, and use this one's base by its commit.
 
 | | A tenant user |
 |---|---|
 | Kubernetes API | in their namespaces only ([`base/role.yaml`](manifests/tenants/base/role.yaml)): pods (with logs, `exec`, `attach`, `port-forward`), Deployments, StatefulSets, ReplicaSets, DaemonSets, Jobs, CronJobs, Services, ConfigMaps, Secrets, PersistentVolumeClaims, ServiceAccounts, HorizontalPodAutoscalers, PodDisruptionBudgets, Leases; read-only events, endpoints, NetworkPolicies, the quota and limits, pod metrics. Nothing cluster-scoped, no Roles or RoleBindings, no `escalate`, `bind` or `impersonate`. Like every authenticated user, they may also read the API's discovery documents and ask what they are allowed. |
 | Pods | Pod Security `baseline` enforced, `restricted` warned about and audited: no privileged containers, no host network, PID or IPC namespace, no `hostPath`, no host ports, no capabilities beyond the runtime's defaults. On top of that ([`admission.yaml`](manifests/tenants/admission.yaml), which says why): every container drops `NET_RAW` (added for pods that do not), only `restricted`'s volume types without `csi`, images only from registries on the internet (not localhost, an IP address or a cluster Service), and no Service with `externalIPs`. No PriorityClass, so a tenant's pod never preempts a runner. Unlike the runners, tenant pods may run as root and without a seccomp profile: images that need that (a sandbox that makes user namespaces, say) still run, at the price of more of the kernel within reach of a pod on a privileged node. |
 | Network | In: only from the namespace's own pods, so not from the runners or other tenants. Out: the internet through the proxy, and pods and Services in the cluster subject to their namespace's own policies; not the host, the node's own ports (the API server, also through its Service, and the kubelet) or anything else on the stack network; a NodePort leads to its pods as their own address does, so their namespace's ingress policy decides ([`base/networkpolicy.yaml`](manifests/tenants/base/networkpolicy.yaml)). A tenant cannot change these policies. The node's own image pulls are outside them, which is why images must come from the internet. |
-| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU, memory and ephemeral-storage requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts (one in `build-farm`, its frontend's) or load balancers, and a default memory and ephemeral-storage limit for every container that names none. |
+| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU, memory and ephemeral-storage requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts (one for a tenant whose service a forwarder carries) or load balancers, and a default memory and ephemeral-storage limit for every container that names none. |
 | Reaching the API | Through the forwarder in [`api-forward.yml`](api-forward.yml): port 6443 of the node, and nothing else, on a Docker network of your choice. |
-| Reaching the build farm | Its frontend's port, over TLS: from the runner pods through the cluster's DNS, and through the forwarder in [`farm-forward.yml`](farm-forward.yml) from a Docker network of your choice (below, "The build farm's network"). |
+| Reaching a tenant's service | Nothing outside the namespace, until the admin lets it in: the runner pods through the cluster's DNS, with an egress policy the tenant brings for them, and containers on another Docker network through a forwarder of the host's to the tenant's NodePort (below, "Reaching a tenant's service"). |
 
 **Sizing.** A tenant's requests compete with the runners for the node's allocatable; its limits
 compete for the k3s container's memory. The rule: the tenants' `requests.memory` plus the
@@ -517,7 +518,8 @@ keep a runner `Pending` for long; the tenants' `limits.memory` are what they may
 free, and when it is not, the kernel's OOM killer inside the container picks pods with small
 requests first, which are theirs. The shipped quotas are the repository owner's host's (allocatable
 14 GiB, runners peaking at about 8 GiB of requests): `zuul-trial` 1.5 CPU and 2 GiB of requests, 16
-CPUs and 7 GiB of limits; `build-farm` 2 CPUs and 3 GiB, 12 CPUs and 8 GiB. CPU limits only
+CPUs and 7 GiB of limits, beside the owner's build farm, a tenant kept in another repository
+("Adding a tenant"), with 2 CPUs and 3 GiB, 12 CPUs and 8 GiB. CPU limits only
 throttle a pod, and the k3s container's CPU cap and weight keep the host's share, so they are
 generous. Each quota also bounds the number of objects of every kind a tenant may create, since
 each one is a row in k3s's datastore, which the runners need too. Recompute them for yours.
@@ -539,9 +541,9 @@ Size the tenants' limits against that filesystem, which every pod's `emptyDir` s
 runners' work folders among them: the tenants' `limits.ephemeral-storage` plus the runners' work
 folders at their peak plus the 5% threshold stay within it. The shipped quotas are the repository
 owner's host's, a 50 GiB filesystem for `/var/lib/kubelet`: `zuul-trial` 4 GiB (3 GiB per
-container), `build-farm` 8 GiB (6 GiB per container), which leaves the runners 35.5 GiB. Data that
-should outlive a pod or is large, a build cache say, goes on a PersistentVolume of its own
-filesystem instead, as `build-farm`'s cache does (below).
+container), and the build farm 8 GiB (6 GiB per container), which leaves the runners 35.5 GiB.
+Data that should outlive a pod or is large, a build cache say, goes on a PersistentVolume of its
+own filesystem instead (below, "A tenant's cache on the host").
 
 **This needs the kubelet's local storage isolation**, which is on unless
 `--kubelet-arg=local-storage-capacity-isolation=false` is in `K3S_EXTRA_ARGS` (the way out when the
@@ -627,191 +629,87 @@ cluster roles a tenant's software asks for, the host's directories and their quo
 and this directory. Give a PersistentVolume made for a tenant a `claimRef` naming that
 namespace and claim: an unclaimed volume binds to any claim that fits, in any namespace.
 
-**A tenant's cache on the host.** `build-farm` ships one: a hostPath PersistentVolume,
-`build-farm-cache` ([`build-farm/cache-volume.yaml`](manifests/tenants/build-farm/cache-volume.yaml)),
-reserved by its `claimRef` for the claim `cache` in `build-farm`
-([`cache-claim.yaml`](manifests/tenants/build-farm/cache-claim.yaml)). It is for a remote build
-cache (Buildbarn's storage) that must outlive its pods and must not share the kubelet's
-filesystem. Its sizes and eviction settings are in [`cache.libsonnet`](manifests/tenants/build-farm/server/config/cache.libsonnet),
-which the storage pod's configuration imports: fixed-size files of 131.2 GiB in all, recycled
-block by block, so the cache cannot outgrow them. Before applying it, the admin gives it a
-filesystem of its own with a quota above that total (150 GiB, the volume's capacity;
-`scripts/check-consistency.sh` checks the files fit), excluded from snapshots like `CACHE_DIR`,
-and with `exec`, `setuid` and `devices` off. The directory the volume names belongs to the
-storage pod's user:
+**A tenant's cache on the host.** A tenant whose data must outlive its pods and must not share the
+kubelet's filesystem (a remote build cache, say) gets a hostPath PersistentVolume from the admin,
+on a filesystem of its own. The example ships one,
+[`example/cache-volume.yaml`](manifests/tenants/example/cache-volume.yaml), reserved by its
+`claimRef` for the claim `cache` in `example` ([`cache-claim.yaml`](manifests/tenants/example/cache-claim.yaml)).
+Before applying it, the admin gives it a filesystem with a quota at the volume's capacity, excluded
+from snapshots like `CACHE_DIR`, and with `exec`, `setuid` and `devices` off. The directory the
+volume names belongs to the user the tenant's pod runs as:
 
 ```sh
-sudo install -d -o 65532 -g 65532 -m 700 /path/to/build-farm-cache/storage
+sudo install -d -o <uid> -g <gid> -m 700 /path/to/example-cache
 ```
 
 The k3s container sees it through a bind mount in `docker-compose.override.yml`, next to
-`docker-compose.yml`, which Compose reads by itself. It is not in `docker-compose.yml` because the
-cache is optional:
+`docker-compose.yml`, which Compose reads by itself. It is not in `docker-compose.yml` because it
+is the tenant's, not the stack's:
 
 ```yaml
 services:
   k3s:
     volumes:
       - type: bind
-        source: /path/to/build-farm-cache
-        target: /var/lib/build-farm-cache
+        source: /path/to/example-cache
+        target: /var/lib/example-cache
         bind:
           create_host_path: false   # no cache filesystem, no node: never an empty directory instead
 ```
 
 `docker compose up -d` then recreates the node, which fails any job running at that moment
 (drain first, [Operations](#operations)). Removing it: delete the claim, then the volume
-(`kubectl delete pv build-farm-cache`; `Retain` keeps the files until then), remove the mount
-and recreate the node, then the filesystem. Emptying the cache: stop the storage pod and delete the
-files under `storage/`; the next builds are cold.
+(`kubectl delete pv example-cache`; `Retain` keeps the files until then), remove the mount
+and recreate the node, then the filesystem.
 
-**The build farm's server.** `build-farm` ships one, for the tenant to apply:
-[Buildbarn](https://github.com/buildbarn)'s remote cache and the scheduler for remote execution,
-in [`build-farm/server/`](manifests/tenants/build-farm/server). Three workloads, one replica each:
+**Adding a tenant.** Copy [`manifests/tenants/example/`](manifests/tenants/example) to a directory
+named after it: its namespace (with the label `arc-on-nas/tenant`, which the admission policies
+match), its quota and LimitRange (sized as above), its cache volume and claim if it needs one, an
+ingress NetworkPolicy of its own if anything outside the namespace reaches it (below), and
+[`base/`](manifests/tenants/base) last, for the shared policies, the Role and the RoleBinding. List it in
+[`manifests/tenants/kustomization.yaml`](manifests/tenants/kustomization.yaml), and apply as above.
 
-| Workload | What | Requests | Limits |
-|---|---|---|---|
-| `storage` (StatefulSet) | bb-storage on the claim `cache`: the CAS, the action cache and the file system access cache ([`config/cache.libsonnet`](manifests/tenants/build-farm/server/config/cache.libsonnet)) | 100m, 256Mi | 2 CPUs, 1Gi |
-| `scheduler` (Deployment) | bb-scheduler: the queue between the frontend and the workers, in memory | 50m, 64Mi | 1 CPU, 256Mi |
-| `frontend` (Deployment) | bb-storage as the clients' one address, `frontend.build-farm:8980`: cache requests to `storage`, execution to `scheduler` | 100m, 128Mi | 2 CPUs, 512Mi |
+A tenant kept in another repository, with its software, does the same there: its kustomization
+lists this repository's base by its commit instead of `../base`,
 
-Together they request 250m and 448Mi and are limited to 5 CPUs and 1.75 GiB, which leaves the rest
-of the quota (1.75 CPUs and 2.5 GiB requested, 6.25 GiB of memory limits) for the execution
-workers, which are not part of this. They each measured about 30 MiB idle; `GOMEMLIMIT` keeps Go's
-heap below each limit, and the storage pod's limit leaves room for the page cache of its files.
-Every container runs as uid 65532, the cache directory's owner, without capabilities or a
-writable root filesystem, and meets Pod Security `restricted`. The frontend speaks TLS only, with
-the key pair in the Secret `frontend-tls`, and takes no action result or file system access
-profile from a client: only the workers write those, to the storage pod. Nothing authenticates a
-client yet. The runner pods and the forwarder reach the frontend, and only pods in `build-farm`
-reach the other two (below, "The build farm's network").
-
-Applying it, as the tenant, once the admin has applied `manifests/tenants` and made the cache's
-filesystem (above), and with the frontend's key pair (below, `scripts/farm-tls.sh`):
-
-```sh
-kubectl -n build-farm apply -f manifests/tenants/build-farm/cache-claim.yaml
-scripts/farm-tls.sh server --ca-cert ca.crt --ca-key <(secret-store get farm-ca-key) | kubectl -n build-farm apply -f -
-kubectl -n build-farm apply -k manifests/tenants/build-farm/server
-kubectl -n build-farm rollout status statefulset/storage
+```yaml
+resources:
+  - namespace.yaml
+  # ...
+  - https://github.com/kristofk/arc-on-nas//manifests/tenants/base?ref=<commit>
 ```
 
-The configuration is jsonnet in [`config/`](manifests/tenants/build-farm/server/config), generated
-into a ConfigMap whose name carries a hash of its contents, so a changed file replaces the pods
-that use it. The storage pod is never two: its StatefulSet stops the old pod before it starts a
-new one. On SIGTERM bb-storage writes its state before it exits, so a pod restart or a drain keeps
-the cache. A crash, or a node stopped without a drain (`docker compose up -d` recreating it, a host
-reboot), kills the pod instead, and loses what was stored after the last state it wrote: normally
-the last five minutes or so, since it writes its state at most once every five minutes after
-writes, and more when syncing its files was slow or failing (bb-storage retries a failed sync with
-no deadline). The scheduler's queue does not survive a restart: the operations in it fail, and Bazel retries them. The smoke test
-applies the server as a tenant, writes a blob and an action result through the frontend from a
-pod in the namespace, reads them back, restarts the storage pod and reads them again.
+and the admin applies it from a checkout of that repository, with kustomize, which fetches the base
+with git: `kubectl kustomize <dir> | docker compose exec -T k3s kubectl apply -f -`. Its users
+get their certificates as above; `admission.yaml` covers it by its label, applied with this
+repository's tenants. Move the commit when the base changes here, and compare with `kubectl diff`
+before applying. This repository's owner keeps two that way, in AIDepartment: the build farm
+(`deploy/build-farm/`, Buildbarn, with its cache, its server, its network and TLS, and its own
+checks) and Zuul (`deploy/zuul/`).
 
-**Upgrading the build farm's server.** Buildbarn publishes no releases, only an image per commit,
-and its configuration's schema changes between them. Follow
-[bb-deployments](https://github.com/buildbarn/bb-deployments), which pins a set that works
-together (bb-storage, bb-scheduler and the workers' images), and upgrade them all at once:
+**Reaching a tenant's service.** A tenant's pods are reached by nothing outside their namespace
+until the admin lets something in, with policies that come with the tenant and that the admin
+applies (a tenant can read its policies, not change them):
 
-1. Pick a bb-deployments commit. Diff its `kubernetes/config/` with the one pinned now (named in
-   [`build-farm/server/kustomization.yaml`](manifests/tenants/build-farm/server/kustomization.yaml)),
-   and carry each change into `config/`. Read its `changelog.md` for anything that changes the
-   storage format.
-2. Set the images in `storage.yaml`, `frontend.yaml` and `scheduler.yaml` to its tags, each with
-   its digest (`crane digest ghcr.io/buildbarn/bb-storage:<tag>`), and the commit in
-   `kustomization.yaml`. `scripts/lint.sh` evaluates the configuration, renders the manifests,
-   and checks the frontend and the storage pod run the same bb-storage.
-3. Review and merge, then apply as above from the merged commit and watch
-   `kubectl -n build-farm rollout status statefulset/storage` (then `deployment/scheduler` and
-   `deployment/frontend`). The storage pod is down while it restarts, typically seconds: builds
-   in flight retry, or build locally where they are set to fall back. After the rollout, a build with the remote
-   cache must still get hits; `kubectl -n build-farm logs storage-0` says
-   `Reinitializing data store` for each store whose state the new version could not read, which
-   empties that store (cold builds, no other harm).
-4. Rolling back: revert the commit, review, and apply again; or, at once,
-   `kubectl -n build-farm rollout undo statefulset/storage` (and the same for the two
-   Deployments), then the revert, so the repository matches what runs. A rollback across a
-   storage format change empties the cache in the same way.
+- **The runner pods** (`arc-runners`) reach it through the cluster's DNS and the tenant's Service.
+  Their own egress policy allows DNS and the proxy only, so the tenant brings an egress policy for
+  `arc-runners` to its pods' port, and its own ingress policy lets in the namespace `arc-runners`.
+- **Containers on another Docker network** reach it through a forwarder of the host's own, on
+  that network and on the stack network, to the tenant's NodePort on the node's address
+  (`172.31.250.10`), as [`api-forward.yml`](api-forward.yml) does for the API server. The
+  forwarder takes a fixed address on the stack network that nothing else here uses, and the
+  tenant's ingress policy lets in that address and no other. Its NodePort Service keeps the
+  connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it is, and
+  its quota allows that one NodePort. Since the policy trusts the forwarder's address, the
+  forwarder must carry nobody else from there: it listens only on its address on the other
+  network, and takes connections only from that network's subnet, less its gateway (the host).
+  A host port instead would listen on the host's addresses, so the LAN would reach the service.
 
-Removing it: `kubectl -n build-farm delete -k manifests/tenants/build-farm/server`. The claim and
-the cache stay; delete the claim too for the admin's removal of the volume (above).
-
-**The build farm's network.** The frontend, `frontend` in `build-farm`, is the farm's one address, on port 8980, over TLS. Who
-reaches it, and how:
-
-| Client | Route | Name in the certificate |
-|---|---|---|
-| The runner pods (`arc-runners`) | The cluster's DNS and the frontend's Service. Their egress policy allows that port of that pod ([`networkpolicy-runners.yaml`](manifests/networkpolicy-runners.yaml), `allow-build-farm`). | `frontend.build-farm.svc` (and `.cluster.local`) |
-| Containers on another Docker network | [`farm-forward.yml`](farm-forward.yml), socat with the alias `build-farm` on that network, to the frontend's NodePort `frontend-external` on the node's address (`172.31.250.10:30980`). | `build-farm` |
-| Anything that reaches that network's containers | A TCP forward of its own to `build-farm:8980` (a Tailscale node's `serve` TCP forward, say). TLS still ends at the frontend. | its own name, given to `scripts/farm-tls.sh` |
-| The namespace's own pods | The Service, as before. | `frontend` |
-
-Nothing else reaches it. The frontend's ingress policy
-([`build-farm/networkpolicy.yaml`](manifests/tenants/build-farm/networkpolicy.yaml)) admits the
-runner pods, by their namespace, and the forwarder, by its fixed address on the stack network,
-`172.31.250.12`, to port 8980 only. The other tenants, other namespaces, the host and anything
-else on the stack network are turned away, at the Service and at the NodePort alike: the NodePort
-keeps the connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it
-is. Since the policy trusts the forwarder's address, the forwarder carries nobody else from
-there: it listens only on its address on the other network, which nothing on the stack network
-can reach, and takes connections only from that network's subnet, less its gateway. Docker lets
-the host reach every container's address, internal networks too, and a process on the host may
-connect from any of the host's addresses: the one in that subnet is the gateway, and the others
-are outside it. No host port is published,
-so the LAN and the internet reach none of this. The runners reach
-neither the storage pod nor the scheduler. Everything else on the forwarder's Docker network reaches the
-frontend's port, as with the API forwarder; per-client credentials, on top of TLS, are what will
-tell those clients apart. The smoke test checks each route and each refusal.
-
-**Why a forwarder, and not a host port.** A host port listens on the host's addresses, so the LAN
-would reach the farm; Docker's internal networks don't, and the forwarder is on two of them. It
-holds no key and changes nothing in the cluster, and the NodePort it needs answers only to its
-address.
-
-**TLS.** The frontend's certificate is signed by a CA of the farm's own, made with
-[`scripts/farm-tls.sh`](scripts/farm-tls.sh). Clients trust that CA for the farm and for nothing
-else. It is valid for 5 years, the frontend's certificate for 90 days. The CA's certificate is
-public, and its key belongs in a secret store, never in a file or this repository. bb-storage
-reads the key pair again every minute and reports its expiry in its metrics
-(`tls_certificate_not_after_time_seconds`).
-
-```sh
-# Once: the CA. Keep the key in a secret store, then delete the file.
-scripts/farm-tls.sh ca farm-ca
-# The frontend's key pair, as the tenant, with any other name a route reaches it by.
-scripts/farm-tls.sh server --ca-cert farm-ca/ca.crt --ca-key <(secret-store get farm-ca-key) [NAME...] \
-  | kubectl -n build-farm apply -f -
-```
-
-- **Renewing** the frontend's certificate is the second command again, before the 90 days end.
-  The kubelet updates the Secret's files in the pod within about two minutes, and the frontend
-  serves the new certificate from then on, with no restart. Check:
-  `kubectl -n build-farm get secret frontend-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -enddate`.
-- **Replacing the CA**, before it expires or if its key leaks: make a new one, give clients both
-  CAs' certificates in one file, renew the frontend's certificate from the new CA, and drop the
-  old CA from the clients once every client has the new one. A leaked frontend key needs only a
-  renewal: the old certificate is then no longer served, but stays valid until it expires, since
-  nothing here publishes revocations.
-
-**Applying it**, as the admin, with the rest (both are in the kustomizations above), and the
-forwarder once the tenant has applied the server:
-
-```sh
-docker compose exec k3s kubectl apply -k /opt/arc-on-nas/manifests
-docker compose exec k3s kubectl apply -k /opt/arc-on-nas/manifests/tenants
-FARM_FORWARD_NETWORK=<network> docker compose -f farm-forward.yml up -d
-```
-
-The forwarder takes the gateway to be the network's first address, as Docker makes it. If
-`docker network inspect <network>` shows another, add `FARM_FORWARD_GATEWAY=<that address>`. Its
-log's first line says what it listens on, the subnet it takes connections from, and the gateway
-it refuses.
-
-Check, from a container on `<network>` with the CA's certificate:
-`grpcurl -cacert ca.crt build-farm:8980 grpc.health.v1.Health/Check` answers `SERVING`. From the
-host, the same to the forwarder's address on `<network>` gets no TLS session, also with curl's
-`--interface` set to another of the host's addresses, and to `172.31.250.12` no connection.
-Removing the forwarder: `docker compose -p ci-farm down`.
+Nothing else gets through: the other tenants, other namespaces, the host and anything else on the
+stack network are turned away by the tenant's ingress policy, at the Service and at the NodePort
+alike. The forwarder is the host's, not this repository's: it names the host's network, and its
+address on the stack network is the host's to choose (this repository's owner keeps theirs with
+the host's setup).
 
 ## Building the images
 
@@ -1163,12 +1061,11 @@ change recreates the node, every pod restarts and the running job fails. Drain f
 | Path | What |
 |---|---|
 | `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
-| `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces, with the build farm's server (Buildbarn) in `manifests/tenants/build-farm/server/`. |
+| `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces, their base and admission policies, and an example tenant to copy. |
 | `api-forward.yml` | The optional forwarder to the API server for tenant users. |
-| `farm-forward.yml` | The optional forwarder to the build farm's frontend for clients on another Docker network. |
 | `helm/` | Values for the controller and the `swift`, `ubuntu` and `browser` scale sets. |
 | `images/` | The runner images. |
-| `scripts/` | `preflight.sh`, `trial.sh`, `register.sh`, `tenant-cert.sh`, `farm-tls.sh`, `warm.sh`, `prune-cache.sh`; `lint.sh` and `check-consistency.sh` for development. |
+| `scripts/` | `preflight.sh`, `trial.sh`, `register.sh`, `tenant-cert.sh`, `warm.sh`, `prune-cache.sh`; `lint.sh` and `check-consistency.sh` for development. |
 | `examples/workflow.yml` | A consumer repository's workflow. |
 | `.github/workflows/` | This repository's CI (lint and the smoke test) and the image builds. |
 

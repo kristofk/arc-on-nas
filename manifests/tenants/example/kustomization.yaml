@@ -1,0 +1,19 @@
+# An example tenant, `example`, to copy for yours (README, "Tenant namespaces", "Adding a tenant").
+# Not listed in ../kustomization.yaml, so `kubectl apply -k manifests/tenants` never applies it;
+# the smoke test does, as the second tenant beside zuul-trial. Its namespace, its budget, a cache
+# volume on the host reserved for its claim, and what every tenant gets: ../base (the policies,
+# then the Role and RoleBinding), last. A tenant that something outside its namespace reaches adds
+# its own ingress NetworkPolicy here (README, "Reaching a tenant's service").
+#
+# A tenant kept in another repository lists arc-on-nas's base by its commit instead of ../base,
+# and its admin applies it from a checkout of that repository:
+#   - https://github.com/kristofk/arc-on-nas//manifests/tenants/base?ref=<commit>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: example
+resources:
+  - namespace.yaml
+  - quota.yaml
+  - cache-volume.yaml
+  - cache-claim.yaml
+  - ../base

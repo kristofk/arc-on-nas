@@ -2,7 +2,6 @@
 # `mise exec -- scripts/lint.sh`. (https://mise.jdx.dev)
 [tools]
 actionlint = "1.7.12"
-go-jsonnet = "0.22.0"
 hadolint = "2.15.1"
 helm = "3.22.0"
 kubeconform = "0.8.0"

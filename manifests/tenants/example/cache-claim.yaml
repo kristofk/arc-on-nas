@@ -1,0 +1,16 @@
+# The claim on cache-volume.yaml. Namespaced, so the tenant may apply it too (../base/role.yaml).
+# It counts against the namespace's requests.storage (quota.yaml).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cache
+  labels:
+    app.kubernetes.io/part-of: arc-on-nas
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: example-cache
+  resources:
+    requests:
+      storage: 1Gi

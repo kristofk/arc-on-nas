@@ -1,6 +1,7 @@
-# Runner pods may resolve names through the cluster DNS, talk to the egress proxy and to the build
-# farm's frontend, and nothing else. k3s enforces NetworkPolicy with its embedded controller;
-# nothing to install.
+# Runner pods may resolve names through the cluster DNS and talk to the egress proxy, and nothing
+# else. A tenant that serves the runners brings an egress policy of its own for arc-runners, which
+# the admin applies with that tenant (README, "Tenant namespaces", "Reaching a tenant's service").
+# k3s enforces NetworkPolicy with its embedded controller; nothing to install.
 #
 # Not guaranteed by any NetworkPolicy: the Kubernetes documentation says traffic between a pod and
 # its own node is always allowed (https://kubernetes.io/docs/concepts/services-networking/network-policies/),
@@ -60,29 +61,3 @@ spec:
       ports:
         - protocol: TCP
           port: 3128
----
-# The build farm's frontend, if the tenant namespace build-farm runs one (README, "Tenant
-# namespaces", "The build farm's network"): its gRPC port, over TLS, at
-# frontend.build-farm.svc:8980. Its own ingress policy lets the runners in
-# (manifests/tenants/build-farm/networkpolicy.yaml). Without a build-farm namespace this allows
-# nothing.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-build-farm
-  namespace: arc-runners
-spec:
-  podSelector: {}
-  policyTypes:
-    - Egress
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: build-farm
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: frontend
-      ports:
-        - protocol: TCP
-          port: 8980

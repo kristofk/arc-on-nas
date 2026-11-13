@@ -6,7 +6,9 @@
 #
 # Each tenant is a directory: its namespace, quota and limits, plus base/ (the policies, then
 # the Role and RoleBinding) with its namespace set by kustomize. admission.yaml holds what Pod
-# Security "baseline" leaves open, for every namespace labelled as a tenant.
+# Security "baseline" leaves open, for every namespace labelled as a tenant. example/ is one to
+# copy, and is not listed; a tenant kept in another repository lists base/ by its commit and is
+# applied from there (README, "Adding a tenant").
 #
 # Applied in the order listed (sortOptions fifo), so that the admission policies, the quotas and
 # the NetworkPolicies exist before the RoleBinding gives the users anything.
@@ -17,4 +19,3 @@ sortOptions:
 resources:
   - admission.yaml
   - zuul-trial
-  - build-farm
