@@ -1,8 +1,8 @@
 # The namespace's budget (README, "Tenant namespaces", for the arithmetic). Requests are what the
 # scheduler admits against the node's allocatable, so they are kept small enough to fit beside
 # the runners at their peak; limits are what a pod may use when memory is free, and the k3s
-# container's own cap bounds them all. Every container gets a memory limit from the LimitRange
-# below when it names none.
+# container's own cap bounds them all. Every container gets a memory and an ephemeral-storage
+# limit from the LimitRange below when it names none.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -16,6 +16,11 @@ spec:
     # 7 GiB, not 6: the trial's pods hold about 5.25 GiB of limits, and a rolling update
     # starts a pod's replacement (1.5 GiB for the executor) before the old one goes.
     limits.memory: 7Gi
+    # Disk on the node: emptyDir volumes, the containers' writable layers and their logs, which
+    # the kubelet adds up per pod and evicts the pod for when they pass its containers' limits
+    # (README, "Tenant namespaces", "Disk"). The runners' work folders share the filesystem.
+    requests.ephemeral-storage: 4Gi
+    limits.ephemeral-storage: 4Gi
     pods: "20"
     services: "10"
     # A NodePort answers on every address of the node, outside the namespace's NetworkPolicies;
@@ -54,9 +59,12 @@ spec:
       default:
         cpu: "1"
         memory: 512Mi
+        ephemeral-storage: 512Mi
       defaultRequest:
         cpu: 100m
         memory: 128Mi
+        ephemeral-storage: 64Mi
       max:
         cpu: "2"
         memory: 4Gi
+        ephemeral-storage: 3Gi

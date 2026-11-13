@@ -256,7 +256,10 @@ Reporting a vulnerability: [SECURITY.md](SECURITY.md).
   data root is on ZFS and Docker's `overlay2` already works there, the nested containerd should
   too, but the kubelet's disk accounting on pseudo-devices (ZFS, btrfs) has known failure modes
   ([kind known issues](https://kind.sigs.k8s.io/docs/user/known-issues/)). `trial.sh` is the test;
-  the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a dataset without snapshots.
+  the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a dataset without snapshots. If
+  the node still does not come up, `--kubelet-arg=local-storage-capacity-isolation=false` in
+  `K3S_EXTRA_ARGS` is the way out, at a price: nothing then bounds a pod's disk, and the tenant
+  namespaces' pods cannot be scheduled ([Tenant namespaces](#tenant-namespaces), "Disk").
 - **Resources:** about 1.6 GB of memory for the control plane (k3s's own measurement,
   [resource profiling](https://docs.k3s.io/reference/resource-profiling)), plus what the runner
   pods need. The example sizing (`.env.example`, [Sizing](#sizing)) is for a host with 16 CPUs and
@@ -492,7 +495,7 @@ host, no admin kubeconfig, no other namespace. [`manifests/tenants/`](manifests/
 | Kubernetes API | in their namespaces only ([`base/role.yaml`](manifests/tenants/base/role.yaml)): pods (with logs, `exec`, `attach`, `port-forward`), Deployments, StatefulSets, ReplicaSets, DaemonSets, Jobs, CronJobs, Services, ConfigMaps, Secrets, PersistentVolumeClaims, ServiceAccounts, HorizontalPodAutoscalers, PodDisruptionBudgets, Leases; read-only events, endpoints, NetworkPolicies, the quota and limits, pod metrics. Nothing cluster-scoped, no Roles or RoleBindings, no `escalate`, `bind` or `impersonate`. Like every authenticated user, they may also read the API's discovery documents and ask what they are allowed. |
 | Pods | Pod Security `baseline` enforced, `restricted` warned about and audited: no privileged containers, no host network, PID or IPC namespace, no `hostPath`, no host ports, no capabilities beyond the runtime's defaults. On top of that ([`admission.yaml`](manifests/tenants/admission.yaml), which says why): every container drops `NET_RAW` (added for pods that do not), only `restricted`'s volume types without `csi`, images only from registries on the internet (not localhost, an IP address or a cluster Service), and no Service with `externalIPs`. No PriorityClass, so a tenant's pod never preempts a runner. Unlike the runners, tenant pods may run as root and without a seccomp profile: images that need that (a sandbox that makes user namespaces, say) still run, at the price of more of the kernel within reach of a pod on a privileged node. |
 | Network | In: only from the namespace's own pods, so not from the runners or other tenants. Out: the internet through the proxy, and pods and Services in the cluster subject to their namespace's own policies; not the host, the node's own ports (the API server, also through its Service, and the kubelet) or anything else on the stack network; a NodePort leads to its pods as their own address does, so their namespace's ingress policy decides ([`base/networkpolicy.yaml`](manifests/tenants/base/networkpolicy.yaml)). A tenant cannot change these policies. The node's own image pulls are outside them, which is why images must come from the internet. |
-| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU and memory requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts or load balancers, and a default memory limit for every container that names none. |
+| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU, memory and ephemeral-storage requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts or load balancers, and a default memory and ephemeral-storage limit for every container that names none. |
 | Reaching the API | Through the forwarder in [`api-forward.yml`](api-forward.yml): port 6443 of the node, and nothing else, on a Docker network of your choice. |
 
 **Sizing.** A tenant's requests compete with the runners for the node's allocatable; its limits
@@ -507,14 +510,42 @@ throttle a pod, and the k3s container's CPU cap and weight keep the host's share
 generous. Each quota also bounds the number of objects of every kind a tenant may create, since
 each one is a row in k3s's datastore, which the runners need too. Recompute them for yours.
 
-**Disk is not bounded per tenant.** Quotas count claims and their requested sizes. local-path
-(k3s's default StorageClass) does not enforce a claim's size, and on a host that runs the kubelet
-with `--kubelet-arg=local-storage-capacity-isolation=false` (the way out when the kubelet cannot
-measure its filesystem, as on some ZFS hosts) neither are `emptyDir` sizes nor a container's
-writable layer. A tenant can fill the filesystems under the node's
-`/var/lib/kubelet` (every pod's `emptyDir`, the runners' workspaces among them) and
-`/var/lib/rancher/k3s` (images, local-path volumes). Give those their own filesystems with quotas
-if that matters; `build-farm`'s cache has its own (below).
+**Disk.** A pod's ephemeral storage is its `emptyDir` volumes on disk, its containers' writable
+layers and their logs. The kubelet adds them up and evicts a pod whose total passes the sum of its
+containers' `ephemeral-storage` limits, or whose `emptyDir` passes its `sizeLimit`. Each quota
+bounds the namespace's total (`limits.ephemeral-storage`, and `requests.ephemeral-storage` the
+same), and the LimitRange gives every container that names none a limit of 512Mi (64Mi
+requested), up to a maximum per container. So a tenant's pods hold at most their quota's limit on
+the node's disks, plus what a pod writes before the kubelet notices: it checks every 10 seconds,
+but measures `emptyDir` volumes only about once a minute (`volumeStatsAggPeriod`). An
+`emptyDir` with `medium: Memory` counts against memory instead. If the filesystem under
+`/var/lib/kubelet` still gets down to the kubelet's eviction threshold (k3s sets
+`nodefs.available<5%`), the node reports `DiskPressure`, takes no new pods, and evicts the pods
+that use the most disk above their requests first: a runaway pod, whoever's it is.
+
+Size the tenants' limits against that filesystem, which every pod's `emptyDir` shares, the
+runners' work folders among them: the tenants' `limits.ephemeral-storage` plus the runners' work
+folders at their peak plus the 5% threshold stay within it. The shipped quotas are the repository
+owner's host's, a 50 GiB filesystem for `/var/lib/kubelet`: `zuul-trial` 4 GiB (3 GiB per
+container), `build-farm` 8 GiB (6 GiB per container), which leaves the runners 35.5 GiB. Data that
+should outlive a pod or is large, a build cache say, goes on a PersistentVolume of its own
+filesystem instead, as `build-farm`'s cache does (below).
+
+**This needs the kubelet's local storage isolation**, which is on unless
+`--kubelet-arg=local-storage-capacity-isolation=false` is in `K3S_EXTRA_ARGS` (the way out when the
+kubelet cannot measure its filesystem, as on some ZFS hosts: [Requirements](#requirements)). With
+it off the kubelet reports no ephemeral storage and evicts on none, so every tenant pod, which
+requests some through the LimitRange, stays `Pending` with "Insufficient ephemeral-storage". Check
+with `docker compose exec k3s kubectl get node ci-node -o jsonpath='{.status.allocatable.ephemeral-storage}'`:
+empty means off. On such a host, put `/var/lib/kubelet` on a filesystem the kubelet can measure
+(a bind mount of its own, rather than a Docker volume) and turn isolation back on; or delete the
+`ephemeral-storage` lines from the quotas, and then nothing bounds a tenant's disk.
+
+Not bounded by any of this: local-path claims (k3s's default StorageClass, under
+`/var/lib/rancher/k3s/storage`), whose requested size the quota counts but local-path does not
+enforce, and the images a tenant's pods pull into `/var/lib/rancher/k3s/agent`, which the kubelet's
+image garbage collection frees again. Give those directories their own filesystems with quotas if
+that matters.
 
 **Applying it**, once, and after every change to `manifests/tenants/`:
 
@@ -851,6 +882,8 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
 | The node stays `NotReady`; k3s logs "failed to get rootfs info" or overlayfs/snapshotter errors | The storage under Docker's volumes (often ZFS or btrfs). Try `K3S_SNAPSHOTTER=native` in `.env` and `docker compose up -d`; test first with `scripts/trial.sh --snapshotter native`. |
 | System pods stuck in `ContainerCreating` / `ErrImagePull` | Image pulls fail through the proxy. Check the proxy log for `TCP_DENIED`, the host's DNS, and that the proxy is running. |
 | k3s logs "too many open files" or inotify errors | Raise `fs.inotify.max_user_watches` and `max_user_instances` on the host ([Requirements](#requirements)). |
+| Tenant pods `Pending` with "Insufficient ephemeral-storage" | The kubelet runs with `local-storage-capacity-isolation=false`, so the node offers no ephemeral storage ([Tenant namespaces](#tenant-namespaces), "Disk"). |
+| A tenant pod `Failed` with reason `Evicted` and a message about ephemeral local storage | Working as designed: it wrote past its containers' `ephemeral-storage` limits. Raise them within the namespace's quota, or move the data to a volume claim. |
 | Runner pods `Pending` with "Insufficient cpu" or "memory" | Working as designed when the set is at capacity; otherwise `maxRunners` × pod size exceeds allocatable. Redo [Sizing](#sizing). |
 | A runner pod is refused: "violates PodSecurity restricted" | The values file loosened the pod template (root, capabilities, privilege escalation, hostPath). Undo that change. |
 | The listener restarts; logs mention 401, 403 or 404 | The credential lacks the permission in [Adding a repository](#adding-a-repository), has expired, or `githubConfigUrl` is wrong. `scripts/register.sh`, then delete the listener pod. |

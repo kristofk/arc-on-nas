@@ -27,6 +27,14 @@ All notable changes to this repository. The format follows
   quota, the bind mount in `docker-compose.override.yml`). `scripts/lint.sh` evaluates the
   settings and `scripts/check-consistency.sh` checks they fit the volume; the smoke test checks
   the claim binds and another namespace's claim does not.
+- A disk bound for each tenant namespace: `requests.ephemeral-storage` and
+  `limits.ephemeral-storage` in its ResourceQuota (`zuul-trial` 4Gi, `build-farm` 8Gi), and an
+  ephemeral-storage default (512Mi, 64Mi requested) and maximum per container in its LimitRange,
+  so the kubelet evicts a tenant's pod that writes past its limit and the tenants together keep to
+  a known share of the filesystem under `/var/lib/kubelet`, which the runners' work folders share.
+  It needs the kubelet's local storage isolation: with
+  `--kubelet-arg=local-storage-capacity-isolation=false` tenant pods cannot be scheduled (README,
+  "Tenant namespaces", "Disk"). The smoke test checks the defaults, the refusals and an eviction.
 - A browser runner image, `arc-runner-browser`, and its example scale set `helm/browser.yaml`: the
   Ubuntu image plus the shared libraries and fonts headless Chrome for Testing needs, so jobs can
   run page tests without installing packages. Image CI downloads a pinned Chrome for Testing build,

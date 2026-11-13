@@ -6,7 +6,8 @@ name: CI
 #        manifests applied, the credential Secret created by scripts/register.sh, the controller
 #        chart installed through the proxy and running, the runner pod templates admitted by Pod
 #        Security "restricted", the egress rules tested from a pod, and the tenant namespaces: their
-#        permissions, admission's refusals and NET_RAW drops, tenant-cert.sh's refusals and a
+#        permissions, admission's refusals and NET_RAW drops, the ephemeral-storage limits and an
+#        eviction for passing one, tenant-cert.sh's refusals and a
 #        certificate it signs used by kubectl with the kubeconfig it writes through
 #        api-forward.yml, and the tenant NetworkPolicies against each target, with controls.
 #
@@ -60,9 +61,9 @@ jobs:
     name: Smoke test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
-    # Above the sum of the waits below (about 20 minutes), so a slow day ends in a wait's own error
-    # and the diagnostics; a normal run takes about 2 minutes.
-    timeout-minutes: 25
+    # Above the sum of the waits below (about 28 minutes), so a slow day ends in a wait's own error
+    # and the diagnostics; a normal run takes about 4 minutes.
+    timeout-minutes: 32
     env:
       CHART_VERSION: "0.15.0"
       CHARTS: oci://ghcr.io/actions/actions-runner-controller-charts
@@ -364,6 +365,49 @@ jobs:
             | jq -c '[.spec.initContainers[], .spec.containers[]]
                      | map({(.name): .securityContext.capabilities.drop}) | add')
           echo "drops: $got"; [ "$got" = '{"i":["NET_RAW"],"a":["CHOWN","NET_RAW"],"b":["ALL"]}' ]
+          # Disk: the LimitRange's ephemeral-storage default and maximum, the quota's total, and a
+          # pod that writes past its limit is evicted, into an emptyDir or into its own layer, while
+          # one that stays within it runs on. Needs the kubelet's local storage isolation (on here).
+          fmt='{.status.capacity.ephemeral-storage} capacity, {.status.allocatable.ephemeral-storage} allocatable'
+          echo "node ephemeral-storage: $(k get node ci-node -o jsonpath="$fmt")"
+          { k get --raw /api/v1/nodes/ci-node/proxy/configz \
+              | jq -c '.kubeletconfig | {localStorageCapacityIsolation, evictionHard, volumeStatsAggPeriod}'; } \
+            || echo "the kubelet's configz did not answer"
+          got=$(k --as "$u" --as-group devinfra -n zuul-trial apply --dry-run=server -o json -f - <<< "$(pod '' '')" \
+            | jq -c '.spec.containers[0].resources | [.requests["ephemeral-storage"], .limits["ephemeral-storage"]]')
+          echo "plain pod's ephemeral-storage: $got"; [ "$got" = '["64Mi","512Mi"]' ]
+          refused 'maximum ephemeral-storage usage per Container is 3Gi' apply -f - \
+            <<< "$(pod '' ',"resources":{"limits":{"ephemeral-storage":"4Gi"}}')"
+          two='"resources":{"limits":{"ephemeral-storage":"3Gi"}}'
+          cat > "$RUNNER_TEMP/two.json" <<EOF
+          {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "t"}, "spec": {"containers": [
+            {"name": "a", "image": "$CURL_IMAGE", $two}, {"name": "b", "image": "$CURL_IMAGE", $two}]}}
+          EOF
+          refused 'exceeded quota: budget' apply -f - < "$RUNNER_TEMP/two.json"
+          # writer <name> <dir> <MiB>: a pod with a 64Mi limit that writes <MiB> into <dir>, then
+          # waits; /scratch is an emptyDir, anything else is in the container's own layer.
+          writer() {
+            jq -n --arg name "$1" --arg dir "$2" --arg mib "$3" --arg image "$BUSYBOX_IMAGE" '
+              {apiVersion: "v1", kind: "Pod", metadata: {name: $name}, spec: {restartPolicy: "Never",
+                containers: [{name: "w", image: $image,
+                  command: ["sh", "-c", "dd if=/dev/zero of=\($dir)/fill bs=1M count=\($mib) && sleep 600"],
+                  resources: {limits: {"ephemeral-storage": "64Mi"}}}]}}
+              | if $dir == "/scratch" then .spec.volumes = [{name: "s", emptyDir: {}}]
+                  | .spec.containers[0].volumeMounts = [{name: "s", mountPath: "/scratch"}] else . end' \
+              | k --as "$u" --as-group devinfra -n zuul-trial apply -f -
+          }
+          writer fill-volume /scratch 200
+          writer fill-layer /tmp 200
+          writer within /scratch 16
+          # The kubelet adds up emptyDir volumes about once a minute (its volume stats period).
+          for p in fill-volume fill-layer; do
+            k -n zuul-trial wait --for=jsonpath='{.status.reason}'=Evicted "pod/$p" --timeout=240s
+            echo "$p: $(k -n zuul-trial get pod "$p" -o jsonpath='{.status.phase}: {.status.message}')"
+          done
+          phase=$(k -n zuul-trial get pod within -o jsonpath='{.status.phase}')
+          echo "within: $phase"; [ "$phase" = Running ]
+          k -n zuul-trial delete pod fill-volume fill-layer within --wait=false
+
           # A running pod's image cannot be changed to a refused one.
           k --as "$u" --as-group devinfra -n zuul-trial apply -f - <<< "$(pod '' ',"command":["sleep","600"]')"
           patch='[{"op":"replace","path":"/spec/containers/0/image",'
